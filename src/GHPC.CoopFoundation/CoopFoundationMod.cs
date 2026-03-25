@@ -103,6 +103,22 @@ public sealed class CoopFoundationMod : MelonMod
     private static readonly MelonPreferences_Entry<float> CombatApplyMaxMsPerFrame =
         PrefCategory.CreateEntry("CombatApplyMaxMsPerFrame", 16f);
 
+    /// <summary>Phase 5: replicate authoritative HitResolved events (can be very noisy).</summary>
+    private static readonly MelonPreferences_Entry<bool> HitResolvedReplicationEnabled =
+        PrefCategory.CreateEntry("HitResolvedReplicationEnabled", true);
+
+    /// <summary>Host: max HitResolved sends per second (0 = unlimited).</summary>
+    private static readonly MelonPreferences_Entry<int> HitResolvedMaxPerSecond =
+        PrefCategory.CreateEntry("HitResolvedMaxPerSecond", 60);
+
+    /// <summary>Host: max HitResolved datagrams sent per LateUpdate after per-victim coalesce (0 = unlimited).</summary>
+    private static readonly MelonPreferences_Entry<int> HitResolvedHostMaxPerFrame =
+        PrefCategory.CreateEntry("HitResolvedHostMaxPerFrame", 8);
+
+    /// <summary>Client: max low-priority HitResolved applies per frame.</summary>
+    private static readonly MelonPreferences_Entry<int> HitResolvedApplyMaxPerFrame =
+        PrefCategory.CreateEntry("HitResolvedApplyMaxPerFrame", 8);
+
     /// <summary>Phase 4: host sends GHC ImpactFx for terrain/ricochet/armor/penetration SFX (throttled). Requires combat replication.</summary>
     private static readonly MelonPreferences_Entry<bool> ImpactFxReplicationEnabled =
         PrefCategory.CreateEntry("ImpactFxReplicationEnabled", true);
@@ -180,7 +196,11 @@ public sealed class CoopFoundationMod : MelonMod
             LogCombatReplication.Value,
             LogCombatStruckPerHit.Value,
             CombatApplyMaxPerFrame.Value,
-            CombatApplyMaxMsPerFrame.Value);
+            CombatApplyMaxMsPerFrame.Value,
+            HitResolvedReplicationEnabled.Value,
+            HitResolvedMaxPerSecond.Value,
+            HitResolvedHostMaxPerFrame.Value,
+            HitResolvedApplyMaxPerFrame.Value);
         CoopUdpTransport.SetImpactFxReplicationPrefs(ImpactFxReplicationEnabled.Value, LogImpactFx.Value);
         CoopUdpTransport.SetDamageStateReplicationPrefs(DamageStateReplicationEnabled.Value, LogDamageState.Value);
         ClientSimulationGovernor.Configure(
@@ -204,6 +224,8 @@ public sealed class CoopFoundationMod : MelonMod
 
     public override void OnLateUpdate()
     {
+        if (CoopUdpTransport.IsHost)
+            HostCombatBroadcast.FlushPendingHitResolved(CoopUdpTransport.CombatReplicationLogDamageState);
         ClientSimulationGovernor.TickLateUpdate(Time.deltaTime);
         RemoteGhostService.TickLateUpdate(ShowRemoteGhost.Value, RemoteGhostSmoothing.Value, RemoteGhostYOffset.Value);
         ClientWorldProxyService.TickLateUpdate(

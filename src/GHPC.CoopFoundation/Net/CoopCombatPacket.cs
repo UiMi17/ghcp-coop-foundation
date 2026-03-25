@@ -23,6 +23,18 @@ internal static class CoopCombatPacket
     /// <summary>Phase 4B: host-authoritative compact damage correction (spall parity without per-hit flood).</summary>
     public const byte EventDamageState = 4;
 
+    /// <summary>Phase 5 P0: host-authoritative unit truth flags.</summary>
+    public const byte EventUnitState = 5;
+
+    /// <summary>Phase 5 P0: host-authoritative crew truth snapshot.</summary>
+    public const byte EventCrewState = 6;
+
+    /// <summary>Phase 5 P1: authoritative hit outcome marker.</summary>
+    public const byte EventHitResolved = 7;
+
+    /// <summary>Phase 5 P1: compact flammables/compartment critical state.</summary>
+    public const byte EventCompartmentState = 8;
+
     public const int HeaderLength = 16;
 
     public const int FiredPayloadLength = 36;
@@ -35,6 +47,18 @@ internal static class CoopCombatPacket
     /// <summary>victimNetId + unitDestroyed + 5x component HP% bytes + 2 bytes pad.</summary>
     public const int DamageStatePayloadLength = 12;
 
+    /// <summary>unitNetId + flags + 3-byte pad.</summary>
+    public const int UnitStatePayloadLength = 8;
+
+    /// <summary>unitNetId + present/dead/incap/evac/suspended bitmasks + 3-byte pad.</summary>
+    public const int CrewStatePayloadLength = 12;
+
+    /// <summary>shotId + victimNetId + shooterNetId + ammoKey + impact + hitKind + flags + 2-byte pad.</summary>
+    public const int HitResolvedPayloadLength = 32;
+
+    /// <summary>unitNetId + firePresent + unsecuredFire + combinedFlameHeightPct + internalTempPct + 4-byte pad.</summary>
+    public const int CompartmentStatePayloadLength = 12;
+
     public const int FiredTotalLength = HeaderLength + FiredPayloadLength;
 
     public const int StruckTotalLength = HeaderLength + StruckPayloadLength;
@@ -43,8 +67,16 @@ internal static class CoopCombatPacket
 
     public const int DamageStateTotalLength = HeaderLength + DamageStatePayloadLength;
 
-    /// <summary>Smallest valid GHC v1 datagram (Struck).</summary>
-    public static int MinCombatDatagramLength => StruckTotalLength;
+    public const int UnitStateTotalLength = HeaderLength + UnitStatePayloadLength;
+
+    public const int CrewStateTotalLength = HeaderLength + CrewStatePayloadLength;
+
+    public const int HitResolvedTotalLength = HeaderLength + HitResolvedPayloadLength;
+
+    public const int CompartmentStateTotalLength = HeaderLength + CompartmentStatePayloadLength;
+
+    /// <summary>Smallest valid GHC datagram (UnitState).</summary>
+    public static int MinCombatDatagramLength => UnitStateTotalLength;
 
     public static bool IsCoopCombat(byte[] data, int length) =>
         data != null
@@ -158,6 +190,103 @@ internal static class CoopCombatPacket
         buffer[o++] = 0;
         buffer[o] = 0;
         return DamageStateTotalLength;
+    }
+
+    public static int WriteUnitState(
+        byte[] buffer,
+        uint hostCombatSeq,
+        uint missionToken,
+        byte missionPhase,
+        uint unitNetId,
+        in CoopUnitStateSnapshot state)
+    {
+        if (buffer.Length < UnitStateTotalLength)
+            throw new ArgumentException("buffer too small", nameof(buffer));
+        WriteHeader(buffer, hostCombatSeq, missionToken, missionPhase, EventUnitState);
+        int o = HeaderLength;
+        o = WriteU32(buffer, o, unitNetId);
+        buffer[o++] = state.Flags;
+        buffer[o++] = 0;
+        buffer[o++] = 0;
+        buffer[o] = 0;
+        return UnitStateTotalLength;
+    }
+
+    public static int WriteCrewState(
+        byte[] buffer,
+        uint hostCombatSeq,
+        uint missionToken,
+        byte missionPhase,
+        uint unitNetId,
+        in CoopCrewStateSnapshot state)
+    {
+        if (buffer.Length < CrewStateTotalLength)
+            throw new ArgumentException("buffer too small", nameof(buffer));
+        WriteHeader(buffer, hostCombatSeq, missionToken, missionPhase, EventCrewState);
+        int o = HeaderLength;
+        o = WriteU32(buffer, o, unitNetId);
+        buffer[o++] = state.PresentMask;
+        buffer[o++] = state.DeadMask;
+        buffer[o++] = state.IncapacitatedMask;
+        buffer[o++] = state.EvacuatedMask;
+        buffer[o++] = state.SuspendedMask;
+        buffer[o++] = 0;
+        buffer[o++] = 0;
+        buffer[o] = 0;
+        return CrewStateTotalLength;
+    }
+
+    public static int WriteHitResolved(
+        byte[] buffer,
+        uint hostCombatSeq,
+        uint missionToken,
+        byte missionPhase,
+        uint shotId,
+        uint victimNetId,
+        uint shooterNetId,
+        uint ammoKey,
+        Vector3 impact,
+        byte hitKind,
+        byte flags)
+    {
+        if (buffer.Length < HitResolvedTotalLength)
+            throw new ArgumentException("buffer too small", nameof(buffer));
+        WriteHeader(buffer, hostCombatSeq, missionToken, missionPhase, EventHitResolved);
+        int o = HeaderLength;
+        o = WriteU32(buffer, o, shotId);
+        o = WriteU32(buffer, o, victimNetId);
+        o = WriteU32(buffer, o, shooterNetId);
+        o = WriteU32(buffer, o, ammoKey);
+        o = WriteVec3(buffer, o, impact);
+        buffer[o++] = hitKind;
+        buffer[o++] = flags;
+        buffer[o++] = 0;
+        buffer[o] = 0;
+        return HitResolvedTotalLength;
+    }
+
+    public static int WriteCompartmentState(
+        byte[] buffer,
+        uint hostCombatSeq,
+        uint missionToken,
+        byte missionPhase,
+        uint unitNetId,
+        in CoopCompartmentStateSnapshot state)
+    {
+        if (buffer.Length < CompartmentStateTotalLength)
+            throw new ArgumentException("buffer too small", nameof(buffer));
+        WriteHeader(buffer, hostCombatSeq, missionToken, missionPhase, EventCompartmentState);
+        int o = HeaderLength;
+        o = WriteU32(buffer, o, unitNetId);
+        buffer[o++] = state.FirePresent ? (byte)1 : (byte)0;
+        buffer[o++] = state.UnsecuredFirePresent ? (byte)1 : (byte)0;
+        buffer[o++] = state.CombinedFlameHeightPct;
+        buffer[o++] = state.InternalTemperaturePct;
+        buffer[o++] = 0;
+        buffer[o++] = 0;
+        buffer[o++] = 0;
+        buffer[o] = 0;
+        return CompartmentStateTotalLength;
     }
 
     public static bool TryRead(byte[] data, int length, out byte eventType, out uint hostCombatSeq, out uint missionToken, out byte missionPhase)
@@ -281,6 +410,114 @@ internal static class CoopCombatPacket
             radiatorPct,
             leftTrackPct,
             rightTrackPct);
+        return true;
+    }
+
+    public static bool TryReadUnitState(
+        byte[] data,
+        int length,
+        out uint hostCombatSeq,
+        out uint missionToken,
+        out byte missionPhase,
+        out uint unitNetId,
+        out CoopUnitStateSnapshot state)
+    {
+        unitNetId = 0;
+        state = default;
+        if (!TryRead(data, length, out byte et, out hostCombatSeq, out missionToken, out missionPhase))
+            return false;
+        if (et != EventUnitState || length < UnitStateTotalLength)
+            return false;
+        int o = HeaderLength;
+        unitNetId = ReadU32(data, ref o);
+        state = new CoopUnitStateSnapshot(data[o]);
+        return true;
+    }
+
+    public static bool TryReadCrewState(
+        byte[] data,
+        int length,
+        out uint hostCombatSeq,
+        out uint missionToken,
+        out byte missionPhase,
+        out uint unitNetId,
+        out CoopCrewStateSnapshot state)
+    {
+        unitNetId = 0;
+        state = default;
+        if (!TryRead(data, length, out byte et, out hostCombatSeq, out missionToken, out missionPhase))
+            return false;
+        if (et != EventCrewState || length < CrewStateTotalLength)
+            return false;
+        int o = HeaderLength;
+        unitNetId = ReadU32(data, ref o);
+        byte present = data[o++];
+        byte dead = data[o++];
+        byte incapacitated = data[o++];
+        byte evacuated = data[o++];
+        byte suspended = data[o];
+        state = new CoopCrewStateSnapshot(present, dead, incapacitated, evacuated, suspended);
+        return true;
+    }
+
+    public static bool TryReadHitResolved(
+        byte[] data,
+        int length,
+        out uint hostCombatSeq,
+        out uint missionToken,
+        out byte missionPhase,
+        out uint shotId,
+        out uint victimNetId,
+        out uint shooterNetId,
+        out uint ammoKey,
+        out Vector3 impact,
+        out byte hitKind,
+        out byte flags)
+    {
+        shotId = 0;
+        victimNetId = 0;
+        shooterNetId = 0;
+        ammoKey = 0;
+        impact = default;
+        hitKind = 0;
+        flags = 0;
+        if (!TryRead(data, length, out byte et, out hostCombatSeq, out missionToken, out missionPhase))
+            return false;
+        if (et != EventHitResolved || length < HitResolvedTotalLength)
+            return false;
+        int o = HeaderLength;
+        shotId = ReadU32(data, ref o);
+        victimNetId = ReadU32(data, ref o);
+        shooterNetId = ReadU32(data, ref o);
+        ammoKey = ReadU32(data, ref o);
+        impact = ReadVec3(data, ref o);
+        hitKind = data[o++];
+        flags = data[o];
+        return true;
+    }
+
+    public static bool TryReadCompartmentState(
+        byte[] data,
+        int length,
+        out uint hostCombatSeq,
+        out uint missionToken,
+        out byte missionPhase,
+        out uint unitNetId,
+        out CoopCompartmentStateSnapshot state)
+    {
+        unitNetId = 0;
+        state = default;
+        if (!TryRead(data, length, out byte et, out hostCombatSeq, out missionToken, out missionPhase))
+            return false;
+        if (et != EventCompartmentState || length < CompartmentStateTotalLength)
+            return false;
+        int o = HeaderLength;
+        unitNetId = ReadU32(data, ref o);
+        bool firePresent = data[o++] != 0;
+        bool unsecured = data[o++] != 0;
+        byte flamePct = data[o++];
+        byte tempPct = data[o];
+        state = new CoopCompartmentStateSnapshot(firePresent, unsecured, flamePct, tempPct);
         return true;
     }
 

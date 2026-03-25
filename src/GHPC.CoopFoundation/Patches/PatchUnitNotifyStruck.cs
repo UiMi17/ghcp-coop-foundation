@@ -35,5 +35,15 @@ internal static class PatchUnitNotifyStruck
             __instance,
             force: isSpall,
             logDamageState: CoopUdpTransport.CombatReplicationLogDamageState);
+        HostCombatBroadcast.TrySendUnitState(__instance, force: isSpall, logState: CoopUdpTransport.CombatReplicationLogDamageState);
+        HostCombatBroadcast.TrySendCrewState(__instance, force: isSpall, logState: CoopUdpTransport.CombatReplicationLogDamageState);
+        HostCombatBroadcast.TrySendCompartmentState(__instance, force: isSpall, logState: CoopUdpTransport.CombatReplicationLogDamageState);
+        HostCombatBroadcast.TrySendHitResolved(
+            CoopUnitWireRegistry.GetWireId(__instance),
+            shooter is Unit hu ? CoopUnitWireRegistry.GetWireId(hu) : 0,
+            CoopAmmoKey.FromAmmoType(ammoType),
+            impactWorldPosition,
+            isSpall,
+            CoopUdpTransport.CombatReplicationLogDamageState);
     }
 }

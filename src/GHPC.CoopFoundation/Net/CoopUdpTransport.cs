@@ -71,6 +71,18 @@ internal static class CoopUdpTransport
     /// <summary>Client: max wall milliseconds per frame for GHC apply (0 = unlimited).</summary>
     private static float _combatApplyMaxMsPerFrame = 16f;
 
+    /// <summary>Host: replicate HitResolved events when true.</summary>
+    private static bool _hitResolvedReplicationEnabled = true;
+
+    /// <summary>Host: max HitResolved sends per second (0 = unlimited).</summary>
+    private static int _hitResolvedMaxPerSecond = 60;
+
+    /// <summary>Host: max HitResolved UDP sends per LateUpdate after coalescing (0 = unlimited).</summary>
+    private static int _hitResolvedHostMaxPerFrame = 8;
+
+    /// <summary>Client: max low-priority HitResolved applies per frame.</summary>
+    private static int _hitResolvedApplyMaxPerFrame = 8;
+
     /// <summary>Phase 4: host emits GHC ImpactFx (terrain, ricochet, armor, penetration SFX); requires combat channel on.</summary>
     private static bool _impactFxReplicationEnabled = true;
 
@@ -104,18 +116,34 @@ internal static class CoopUdpTransport
     public static bool IsHostDamageStateReplicationActive =>
         IsHostCombatReplicationActive && _damageStateReplicationEnabled;
 
+    /// <summary>Host: Phase 5 hit outcome event stream.</summary>
+    public static bool IsHostHitResolvedReplicationActive =>
+        IsHostCombatReplicationActive && _hitResolvedReplicationEnabled;
+
+    internal static int HitResolvedMaxPerSecond => _hitResolvedMaxPerSecond;
+
+    internal static int HitResolvedHostMaxPerFrame => _hitResolvedHostMaxPerFrame;
+
     public static void SetCombatReplicationPrefs(
         bool enabled,
         bool logCombat,
         bool logStruckPerHit,
         int maxApplyPerFrame,
-        float maxApplyMsPerFrame)
+        float maxApplyMsPerFrame,
+        bool hitResolvedEnabled,
+        int hitResolvedMaxPerSecond,
+        int hitResolvedHostMaxPerFrame,
+        int hitResolvedApplyMaxPerFrame)
     {
         _combatReplicationEnabled = enabled;
         _logCombatReplication = logCombat;
         _logCombatStruckPerHit = logStruckPerHit;
         _combatApplyMaxPerFrame = maxApplyPerFrame < 0 ? 0 : maxApplyPerFrame;
         _combatApplyMaxMsPerFrame = maxApplyMsPerFrame < 0f ? 0f : maxApplyMsPerFrame;
+        _hitResolvedReplicationEnabled = hitResolvedEnabled;
+        _hitResolvedMaxPerSecond = hitResolvedMaxPerSecond < 0 ? 0 : hitResolvedMaxPerSecond;
+        _hitResolvedHostMaxPerFrame = hitResolvedHostMaxPerFrame < 0 ? 0 : hitResolvedHostMaxPerFrame;
+        _hitResolvedApplyMaxPerFrame = hitResolvedApplyMaxPerFrame < 0 ? 0 : hitResolvedApplyMaxPerFrame;
     }
 
     public static void SetImpactFxReplicationPrefs(bool enabled, bool logImpactFx)
@@ -639,6 +667,7 @@ internal static class CoopUdpTransport
 
         ClientCombatApplier.DrainPendingCombat(
             _combatApplyMaxPerFrame,
+            _hitResolvedApplyMaxPerFrame,
             _combatApplyMaxMsPerFrame,
             CombatReplicationLogFired,
             CombatReplicationLogStruckPerHit,

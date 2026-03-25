@@ -13,7 +13,8 @@
 - **Не lockstep:** окремі клієнти не зобов’язані крокувати один фізичний кадр; ціль — **один авторитетний світ на хості** + узгоджені **наслідки** (події/стан) на клієнтах.
 - **Поточний мод (0.3.x):** UDP **GHP** — сесія (Hello/Welcome/Heartbeat), **84 B** пакет позиції (hull/turret/barrel), `unitNetId`, ownership; клієнт — **ghost** (`RemoteGhostService`), не повноцінний `Unit`.
 - **Фаза 3 (закрита в моду v0.5.x):** канал **GHC** — `WeaponFired` / `UnitStruck`, хостові Harmony-патчі, клієнт `NotifyStruck` + ammo key; wire id через **`CoopUnitWireRegistry`** (узгоджено з GHW при колізіях FNV).
-- **Наступні кроки:** **Фаза 5** — придушення локальної AI на клієнті → місія/campaign → надійність (фаза 7). **Фаза 4** закрита у v0.6.x (ImpactFx + damage-state correction).
+- **Фаза 5 (coop truth):** окрім придушення локальної AI на клієнті (`ClientSimulationGovernor`), канал **GHC** розширено **host-authoritative snapshots** (`UnitState`, `CrewState`, `CompartmentState`) + подія **`HitResolved`** (низький пріоритет / телеметрія порівняно з truth snapshots). Деталі wire і тест-матриця: [Phase5CombatTruthTestMatrix.md](Phase5CombatTruthTestMatrix.md), реалізація в `src/GHPC.CoopFoundation/Net/`.
+- **Наступні кроки після truth-sync:** місія/campaign, довготривала надійність (фаза 7). **Фаза 4** закрита у v0.6.x (ImpactFx + damage-state correction).
 
 ---
 
@@ -110,10 +111,15 @@
 
 - **GHP (існуючий):** короткий пакет позиції + сесія; залишається для частого оновлення «свого» юніта та heartbeat.
 - **GHW (пропозиція):** менш часті або більші повідомлення: snapshot сутностей, ефекти, місія.
-- **GHC (v0.5.0+; v0.6.2+ DamageState correction):** окремий magic `GHC`, wire v1 — події **пострілу/влучання/ефектів/корекції пошкоджень** (`Net/CoopCombatPacket.cs`). **Wire net id юнітів:** `CoopUnitWireRegistry` (узгоджено з GHW; FNV + синтетика при колізіях). Ключ набою — FNV-1a від `AmmoType.Name`; резолв на клієнті через `AmmoCodexScriptable` + runtime `LiveRound.SpallAmmoType`. **v0.5.3+ (хост, `WeaponFired`):** після `Fire()` ложе часто вже порожнє (`AmmoFeed` підписаний на `Fired`), тому тип набою для GHC береться з **`WeaponSystem._lastRound.Info`**, далі fallback `CurrentAmmoType`; **`target` net id** — з аргументу `Fire(IUnit)` або з **`InfoBroker.CurrentTarget.Owner`** при `Fire(null)` і наявній цілі. **v0.6.2+:** замість сирого spall-потоку використовується **throttled host-authoritative `DamageState`** (стан ключових `DestructibleComponent` + `UnitDestroyed`) для паритету наслідків без UDP flood. На клієнті GHC ставиться в **FIFO-чергу** і застосовується з **бюджетом на кадр** (`CombatApplyMaxPerFrame`, `CombatApplyMaxMsPerFrame`). Порядок `hostCombatSeq` спільний для всіх типів GHC (при reorder UDP можливі втрати окремих косметичних подій).
+- **GHC (v0.5.0+; v0.6.2+ DamageState; Фаза 5+ combat truth):** окремий magic `GHC`, wire v1 — події **пострілу / влучання / ефектів / корекції пошкоджень / truth snapshots** (`Net/CoopCombatPacket.cs`). **Wire net id юнітів:** `CoopUnitWireRegistry` (узгоджено з GHW; FNV + синтетика при колізіях). Ключ набою — FNV-1a від `AmmoType.Name`; резолв на клієнті через `AmmoCodexScriptable` + runtime `LiveRound.SpallAmmoType`. **v0.5.3+ (хост, `WeaponFired`):** після `Fire()` ложе часто вже порожнє (`AmmoFeed` підписаний на `Fired`), тому тип набою для GHC береться з **`WeaponSystem._lastRound.Info`**, далі fallback `CurrentAmmoType`; **`target` net id** — з аргументу `Fire(IUnit)` або з **`InfoBroker.CurrentTarget.Owner`** при `Fire(null)` і наявній цілі. **v0.6.2+:** замість сирого spall-потоку використовується **throttled host-authoritative `DamageState`** (корпус: двигун/КПП/радіатор/гусениці + `UnitDestroyed`). **Фаза 5 (truth channel):** додаткові типи подій у тому ж потоці `hostCombatSeq`:
+  - **`EventUnitState` (5)** — bitflags: destroyed/incapacitated/abandoned/cannot move/shoot (`CoopUnitStateSnapshot`).
+  - **`EventCrewState` (6)** — маски присутності/статусів по місцях екіпажу (`CoopCrewStateSnapshot`).
+  - **`EventHitResolved` (7)** — компактний «результат пострілу» з хоста; **емісія:** черга в кадрі (остання подія на `victimNetId` до `LateUpdate`) + `FlushPendingHitResolved` з лімітами **`HitResolvedHostMaxPerFrame`** і **`HitResolvedMaxPerSecond`** (без мікро-бурстів на кожен `NotifyStruck`). На клієнті — **низькопріоритетна** черга + coalescing по `victimNetId`. Для health-метрик seq цього типу **не трактується як мережевий gap** (телеметрія vs strict authoritative sequence).
+  - **`EventCompartmentState` (8)** — критичний стан відсіків/flammables (вогонь, температура) (`CoopCompartmentStateSnapshot`).
+  Емісія з хоста: `HostCombatBroadcast` + Harmony після `NotifyStruck`, `NotifyDestroyed`, переходів `NotifyIncapacitated` / `NotifyAbandoned` / `NotifyCannotMove` / `NotifyCannotShoot`. Застосування на клієнті: `ClientCombatApplier` — **дві черги** (truth snapshots і критичні події спочатку, потім slice для `HitResolved`), coalescing **останнього snapshot на `unitNetId`** для DamageState/UnitState/CrewState та окремий dedup Struck по victim. **Мінімальна довжина датаграми GHC** на прийомі прив’язана до найменшого валідного пакета (щоб короткі state-пакети не відсіювались). Бюджет: `CombatApplyMaxPerFrame`, `CombatApplyMaxMsPerFrame`, `HitResolvedApplyMaxPerFrame`. Зведення сесії: `[CoopNet][Summary]` (recv/applied, `destroyParityMismatch`, coalesced, budget hits).
 
 - **GHC ImpactFx (v0.6.0+, Фаза 4 / підтрек A):** `eventType=3` — terrain bullet SFX з хоста (`ImpactSFXManager.PlayTerrainImpactSFX`), throttle на емісії; спільний `hostCombatSeq`; prefs `ImpactFxReplicationEnabled`, `LogImpactFx` (див. AGENTS).
-- **GHC DamageState (v0.6.2+, Фаза 4 / підтрек B):** `eventType=4` — compact damage correction snapshot (`engine/transmission/radiator/left/right track HP%` + `UnitDestroyed`), change-detect + throttle на хості; prefs `DamageStateReplicationEnabled`, `LogDamageState`.
+- **GHC DamageState (v0.6.2+, Фаза 4 / підтрек B):** `eventType=4` — compact damage correction snapshot (`engine/transmission/radiator/left/right track HP%` + `UnitDestroyed`), change-detect + throttle на хості; prefs `DamageStateReplicationEnabled`, `LogDamageState`. *Розширення на довільні `DestructibleComponent` поза шасі — окремий майбутній крок, не обов’язково в цьому snapshot.*
 
 **Версіонування**
 
@@ -149,6 +155,7 @@
 - Сесія: `CoopNetSession`, `CoopControlPacket`
 - Ghost: `RemoteGhostService`, `CoopAimableSampler`
 - Net id: `CoopUnitNetId`
+- **Фаза 5 combat truth:** `CoopCombatPacket` (типи подій 5–8), `CoopUnitStateSnapshot`, `CoopCrewStateSnapshot`, `CoopCompartmentStateSnapshot`, `HostCombatBroadcast`, `ClientCombatApplier`; корекція візуалу/AI для чужих юнітів на клієнті — `ClientSimulationGovernor`; перевірні сценарії — [Phase5CombatTruthTestMatrix.md](Phase5CombatTruthTestMatrix.md).
 
 Після додавання GHW варто явно розділити **парсери** та **черги** за типом пакета, щоб GHP залишався O(1) у гарячому шляху.
 
@@ -156,7 +163,7 @@
 
 ## 8. Відкриті питання (для наступних фаз)
 
-- **Spall / вторинні ушкодження:** у v0.6.2 паритет вирішено через `DamageState` correction (а не raw per-hit spall). До фази 5 можливі edge-case розбіжності таймінгу локальної симуляції.
+- **Spall / вторинні ушкодження:** паритет корпусу та фінальних truth-станів юніта/екіпажу/відсіків намагається тримати **host snapshots** (`DamageState` + `UnitState` / `CrewState` / `CompartmentState`); локальний спал на клієнті може відрізнятись у деталях до застосування correction.
 - **SFX audibility / distance:** `ImpactSFXManager` має внутрішні пороги чутності (terrain/vehicle) і speed-of-sound delay; `GHC recv ImpactFx` не гарантує, що звук має бути чутний з позиції камери клієнта.
 - **UDP косметика:** при reorder/loss окремі ImpactFx можуть губитися; gameplay truth тримається через host-authoritative damage correction.
 - Чи потрібна реплікація **інфантерії** / авіації окремим профілем (різні корені `Unit`)?
@@ -171,4 +178,6 @@
 1. Оновити `GAME_BUILD.txt` після зміни версії гри.
 2. Перегенерувати `artifacts/decompiled/` (ILSpy / аналог).
 3. Пройтися grep-ом по ключових типах (`Unit`, `WeaponSystem`, `LiveRound`, `CampaignSaveState`).
-4. Оновити таблиці §3–§6 при значних змінах API.
+4. Оновити таблиці §3–§6 при значних змінах API (у т.ч. GHC типів подій і prefs Фази 5).
+
+Окремий чеклист Фази 5: [Phase5CombatTruthTestMatrix.md](Phase5CombatTruthTestMatrix.md).

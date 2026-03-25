@@ -18,5 +18,8 @@ internal static class PatchUnitNotifyDestroyed
             __instance,
             force: true,
             logDamageState: CoopUdpTransport.CombatReplicationLogDamageState);
+        HostCombatBroadcast.TrySendUnitState(__instance, force: true, logState: CoopUdpTransport.CombatReplicationLogDamageState);
+        HostCombatBroadcast.TrySendCrewState(__instance, force: true, logState: CoopUdpTransport.CombatReplicationLogDamageState);
+        HostCombatBroadcast.TrySendCompartmentState(__instance, force: true, logState: CoopUdpTransport.CombatReplicationLogDamageState);
     }
 }

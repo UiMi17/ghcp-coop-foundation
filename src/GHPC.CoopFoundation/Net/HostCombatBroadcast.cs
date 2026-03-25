@@ -11,10 +11,41 @@ internal static class HostCombatBroadcast
 {
     private static byte[]? _buffer;
     private static readonly Dictionary<uint, CoopDamageStateSnapshot> LastDamageStateByNetId = new();
+    private static readonly Dictionary<uint, CoopUnitStateSnapshot> LastUnitStateByNetId = new();
+    private static readonly Dictionary<uint, CoopCrewStateSnapshot> LastCrewStateByNetId = new();
+    private static readonly Dictionary<uint, CoopCompartmentStateSnapshot> LastCompartmentStateByNetId = new();
     private static readonly Dictionary<uint, float> NextDamageStateSendTimeByNetId = new();
+    private static readonly Dictionary<uint, float> NextUnitStateSendTimeByNetId = new();
+    private static readonly Dictionary<uint, float> NextCrewStateSendTimeByNetId = new();
+    private static readonly Dictionary<uint, float> NextCompartmentStateSendTimeByNetId = new();
 
     private const float DamageStateMinIntervalSeconds = 0.1f;
+    private const float UnitStateMinIntervalSeconds = 0.05f;
+    private const float CrewStateMinIntervalSeconds = 0.1f;
+    private const float CompartmentStateMinIntervalSeconds = 0.2f;
     private const int DestroyedStateRedundantSends = 3;
+    private static float _hitResolvedWindowStart = float.NegativeInfinity;
+    private static int _hitResolvedSentInWindow;
+
+    private readonly struct HitResolvedPending
+    {
+        public readonly uint ShooterNetId;
+        public readonly uint AmmoKey;
+        public readonly Vector3 Impact;
+        public readonly bool IsSpall;
+        public readonly bool Log;
+
+        public HitResolvedPending(uint shooterNetId, uint ammoKey, Vector3 impact, bool isSpall, bool log)
+        {
+            ShooterNetId = shooterNetId;
+            AmmoKey = ammoKey;
+            Impact = impact;
+            IsSpall = isSpall;
+            Log = log;
+        }
+    }
+
+    private static readonly Dictionary<uint, HitResolvedPending> HitResolvedPendingByVictim = new();
 
     public static bool CanEmit =>
         CoopUdpTransport.IsHostCombatReplicationActive;
@@ -176,17 +207,235 @@ internal static class HostCombatBroadcast
         }
     }
 
+    public static void TrySendUnitState(Unit unit, bool force, bool logState)
+    {
+        if (!CanEmit || unit == null)
+            return;
+        uint unitNetId = CoopUnitWireRegistry.GetWireId(unit);
+        if (unitNetId == 0)
+            return;
+        if (!CoopUnitStateSnapshot.TryCapture(unit, out CoopUnitStateSnapshot snap))
+            return;
+        float now = Time.time;
+        bool hasNext = NextUnitStateSendTimeByNetId.TryGetValue(unitNetId, out float nextTime);
+        bool hasLast = LastUnitStateByNetId.TryGetValue(unitNetId, out CoopUnitStateSnapshot last);
+        bool changed = !hasLast || !snap.NearlyEquals(last);
+        if (!changed)
+            return;
+        if (!force && hasNext && now < nextTime)
+            return;
+
+        EnsureBuffer();
+        uint seq = CoopUdpTransport.TakeNextHostCombatSeq();
+        int len = CoopCombatPacket.WriteUnitState(
+            _buffer!,
+            seq,
+            CoopSessionState.MissionCoherenceToken,
+            CoopSessionState.MissionStateToWirePhase(),
+            unitNetId,
+            snap);
+        if (!CoopUdpTransport.TryHostSendCombat(_buffer!, len))
+            return;
+        LastUnitStateByNetId[unitNetId] = snap;
+        NextUnitStateSendTimeByNetId[unitNetId] = now + UnitStateMinIntervalSeconds;
+        if (logState)
+            MelonLogger.Msg($"[CoopNet] GHC send UnitState seq={seq} unit={unitNetId} flags={snap.Flags}");
+    }
+
+    public static void TrySendCrewState(Unit unit, bool force, bool logState)
+    {
+        if (!CanEmit || unit == null)
+            return;
+        uint unitNetId = CoopUnitWireRegistry.GetWireId(unit);
+        if (unitNetId == 0)
+            return;
+        if (!CoopCrewStateSnapshot.TryCapture(unit, out CoopCrewStateSnapshot snap))
+            return;
+        float now = Time.time;
+        bool hasNext = NextCrewStateSendTimeByNetId.TryGetValue(unitNetId, out float nextTime);
+        bool hasLast = LastCrewStateByNetId.TryGetValue(unitNetId, out CoopCrewStateSnapshot last);
+        bool changed = !hasLast || !snap.NearlyEquals(last);
+        if (!changed)
+            return;
+        if (!force && hasNext && now < nextTime)
+            return;
+
+        EnsureBuffer();
+        uint seq = CoopUdpTransport.TakeNextHostCombatSeq();
+        int len = CoopCombatPacket.WriteCrewState(
+            _buffer!,
+            seq,
+            CoopSessionState.MissionCoherenceToken,
+            CoopSessionState.MissionStateToWirePhase(),
+            unitNetId,
+            snap);
+        if (!CoopUdpTransport.TryHostSendCombat(_buffer!, len))
+            return;
+        LastCrewStateByNetId[unitNetId] = snap;
+        NextCrewStateSendTimeByNetId[unitNetId] = now + CrewStateMinIntervalSeconds;
+        if (logState)
+        {
+            MelonLogger.Msg(
+                $"[CoopNet] GHC send CrewState seq={seq} unit={unitNetId} present/dead/incap/evac/susp={snap.PresentMask}/{snap.DeadMask}/{snap.IncapacitatedMask}/{snap.EvacuatedMask}/{snap.SuspendedMask}");
+        }
+    }
+
+    /// <summary>Queue one HitResolved (latest wins per <paramref name="victimNetId" /> until <see cref="FlushPendingHitResolved" />).</summary>
+    public static void TrySendHitResolved(
+        uint victimNetId,
+        uint shooterNetId,
+        uint ammoKey,
+        Vector3 impact,
+        bool isSpall,
+        bool logEvent)
+    {
+        if (!CanEmit || !CoopUdpTransport.IsHostHitResolvedReplicationActive || victimNetId == 0)
+            return;
+        bool log = logEvent;
+        if (HitResolvedPendingByVictim.TryGetValue(victimNetId, out HitResolvedPending prev))
+            log |= prev.Log;
+        HitResolvedPendingByVictim[victimNetId] = new HitResolvedPending(
+            shooterNetId,
+            ammoKey,
+            impact,
+            isSpall,
+            log);
+    }
+
+    /// <summary>Host: drain coalesced HitResolved queue once per frame (LateUpdate). Spreads UDP and respects per-second budget.</summary>
+    public static void FlushPendingHitResolved(bool logDamageState)
+    {
+        if (!CanEmit || !CoopUdpTransport.IsHostHitResolvedReplicationActive || HitResolvedPendingByVictim.Count == 0)
+            return;
+
+        int maxPerFrame = CoopUdpTransport.HitResolvedHostMaxPerFrame;
+        var keys = new List<uint>(HitResolvedPendingByVictim.Keys);
+        keys.Sort();
+        int sent = 0;
+        for (int i = 0; i < keys.Count; i++)
+        {
+            if (maxPerFrame > 0 && sent >= maxPerFrame)
+                break;
+            if (!CanSendHitResolvedThisSecond())
+                break;
+            uint victimNetId = keys[i];
+            if (!HitResolvedPendingByVictim.TryGetValue(victimNetId, out HitResolvedPending p))
+                continue;
+
+            EnsureBuffer();
+            uint seq = CoopUdpTransport.TakeNextHostCombatSeq();
+            int len = CoopCombatPacket.WriteHitResolved(
+                _buffer!,
+                seq,
+                CoopSessionState.MissionCoherenceToken,
+                CoopSessionState.MissionStateToWirePhase(),
+                seq,
+                victimNetId,
+                p.ShooterNetId,
+                p.AmmoKey,
+                p.Impact,
+                p.IsSpall ? (byte)2 : (byte)1,
+                p.IsSpall ? (byte)1 : (byte)0);
+            if (!CoopUdpTransport.TryHostSendCombat(_buffer!, len))
+                continue;
+            NoteHitResolvedSent();
+            HitResolvedPendingByVictim.Remove(victimNetId);
+            sent++;
+            if (logDamageState && p.Log)
+            {
+                MelonLogger.Msg(
+                    $"[CoopNet] GHC send HitResolved seq={seq} victim={victimNetId} shooter={p.ShooterNetId} ammoKey={p.AmmoKey} spall={p.IsSpall}");
+            }
+        }
+    }
+
+    private static bool CanSendHitResolvedThisSecond()
+    {
+        int maxPerSecond = CoopUdpTransport.HitResolvedMaxPerSecond;
+        if (maxPerSecond <= 0)
+            return true;
+        float now = Time.time;
+        if (float.IsNegativeInfinity(_hitResolvedWindowStart) || now - _hitResolvedWindowStart >= 1f)
+        {
+            _hitResolvedWindowStart = now;
+            _hitResolvedSentInWindow = 0;
+        }
+
+        return _hitResolvedSentInWindow < maxPerSecond;
+    }
+
+    private static void NoteHitResolvedSent()
+    {
+        if (CoopUdpTransport.HitResolvedMaxPerSecond > 0)
+            _hitResolvedSentInWindow++;
+    }
+
+    public static void TrySendCompartmentState(Unit unit, bool force, bool logState)
+    {
+        if (!CanEmit || unit == null)
+            return;
+        uint unitNetId = CoopUnitWireRegistry.GetWireId(unit);
+        if (unitNetId == 0)
+            return;
+        if (!CoopCompartmentStateSnapshot.TryCapture(unit, out CoopCompartmentStateSnapshot snap))
+            return;
+        float now = Time.time;
+        bool hasNext = NextCompartmentStateSendTimeByNetId.TryGetValue(unitNetId, out float nextTime);
+        bool hasLast = LastCompartmentStateByNetId.TryGetValue(unitNetId, out CoopCompartmentStateSnapshot last);
+        bool changed = !hasLast || !snap.NearlyEquals(last);
+        if (!changed)
+            return;
+        if (!force && hasNext && now < nextTime)
+            return;
+
+        EnsureBuffer();
+        uint seq = CoopUdpTransport.TakeNextHostCombatSeq();
+        int len = CoopCombatPacket.WriteCompartmentState(
+            _buffer!,
+            seq,
+            CoopSessionState.MissionCoherenceToken,
+            CoopSessionState.MissionStateToWirePhase(),
+            unitNetId,
+            snap);
+        if (!CoopUdpTransport.TryHostSendCombat(_buffer!, len))
+            return;
+        LastCompartmentStateByNetId[unitNetId] = snap;
+        NextCompartmentStateSendTimeByNetId[unitNetId] = now + CompartmentStateMinIntervalSeconds;
+        if (logState)
+        {
+            MelonLogger.Msg(
+                $"[CoopNet] GHC send CompartmentState seq={seq} unit={unitNetId} fire={snap.FirePresent} unsecured={snap.UnsecuredFirePresent} flamePct={snap.CombinedFlameHeightPct} tempPct={snap.InternalTemperaturePct}");
+        }
+    }
+
     public static void ResetSession()
     {
         LastDamageStateByNetId.Clear();
+        LastUnitStateByNetId.Clear();
+        LastCrewStateByNetId.Clear();
+        LastCompartmentStateByNetId.Clear();
         NextDamageStateSendTimeByNetId.Clear();
+        NextUnitStateSendTimeByNetId.Clear();
+        NextCrewStateSendTimeByNetId.Clear();
+        NextCompartmentStateSendTimeByNetId.Clear();
+        _hitResolvedWindowStart = float.NegativeInfinity;
+        _hitResolvedSentInWindow = 0;
+        HitResolvedPendingByVictim.Clear();
     }
 
     private static void EnsureBuffer()
     {
         int need = Math.Max(
             CoopCombatPacket.FiredTotalLength,
-            Math.Max(CoopCombatPacket.StruckTotalLength, Math.Max(CoopCombatPacket.ImpactFxTotalLength, CoopCombatPacket.DamageStateTotalLength)));
+            Math.Max(
+                CoopCombatPacket.StruckTotalLength,
+                Math.Max(
+                    CoopCombatPacket.ImpactFxTotalLength,
+                    Math.Max(
+                        CoopCombatPacket.DamageStateTotalLength,
+                        Math.Max(
+                            CoopCombatPacket.UnitStateTotalLength,
+                            Math.Max(CoopCombatPacket.CrewStateTotalLength, Math.Max(CoopCombatPacket.HitResolvedTotalLength, CoopCombatPacket.CompartmentStateTotalLength)))))));
         if (_buffer == null || _buffer.Length < need)
             _buffer = new byte[need];
     }

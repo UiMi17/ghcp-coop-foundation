@@ -12,7 +12,8 @@ namespace GHPC.CoopFoundation.Net;
 /// <summary>Client: queue GHC from host, apply on main thread with per-frame budget (order preserved).</summary>
 internal static class ClientCombatApplier
 {
-    private static readonly Queue<PendingCombatPacket> Pending = new();
+    private static readonly Queue<PendingCombatPacket> PendingHigh = new();
+    private static readonly Queue<PendingCombatPacket> PendingLow = new();
     private static readonly HashSet<uint> CoalescedSeq = new();
 
     private static uint _lastCombatSeq;
@@ -24,6 +25,12 @@ internal static class ClientCombatApplier
     private static uint _damageStateApplyFailCount;
     private static uint _damageStateRecvCount;
     private static uint _damageStateApplyCount;
+    private static uint _unitStateRecvCount;
+    private static uint _unitStateApplyCount;
+    private static uint _crewStateRecvCount;
+    private static uint _crewStateApplyCount;
+    private static uint _hitResolvedRecvCount;
+    private static uint _compartmentStateRecvCount;
     private static uint _damageStateCoalescedCount;
     private static uint _struckCoalescedCount;
     private static uint _damageStateDestroyParityMismatchCount;
@@ -47,7 +54,7 @@ internal static class ClientCombatApplier
     /// <summary>While true, host struck Harmony postfix must not re-broadcast to UDP.</summary>
     public static bool SuppressStruckBroadcast { get; private set; }
 
-    public static int PendingCombatCount => Pending.Count;
+    public static int PendingCombatCount => PendingHigh.Count + PendingLow.Count;
 
     public static void ResetSession()
     {
@@ -61,6 +68,12 @@ internal static class ClientCombatApplier
         _damageStateApplyFailCount = 0;
         _damageStateRecvCount = 0;
         _damageStateApplyCount = 0;
+        _unitStateRecvCount = 0;
+        _unitStateApplyCount = 0;
+        _crewStateRecvCount = 0;
+        _crewStateApplyCount = 0;
+        _hitResolvedRecvCount = 0;
+        _compartmentStateRecvCount = 0;
         _damageStateCoalescedCount = 0;
         _struckCoalescedCount = 0;
         _damageStateDestroyParityMismatchCount = 0;
@@ -69,14 +82,16 @@ internal static class ClientCombatApplier
         _nextSeqGapLogTime = float.NegativeInfinity;
         _nextQueuePressureLogTime = float.NegativeInfinity;
         _nextBudgetHitLogTime = float.NegativeInfinity;
-        Pending.Clear();
+        PendingHigh.Clear();
+        PendingLow.Clear();
         CoalescedSeq.Clear();
     }
 
     /// <summary>Drop queued GHC without resetting seq (e.g. combat replication pref off).</summary>
     public static void ClearPendingQueueOnly()
     {
-        Pending.Clear();
+        PendingHigh.Clear();
+        PendingLow.Clear();
         CoalescedSeq.Clear();
     }
 
@@ -89,13 +104,28 @@ internal static class ClientCombatApplier
             return;
         if (!CoopCombatPacket.IsCoopCombat(data, length))
             return;
+        if (CoopCombatPacket.TryRead(data, length, out byte eventType, out uint eventSeq, out _, out _)
+            && eventType == CoopCombatPacket.EventHitResolved)
+        {
+            // HitResolved is low-priority telemetry; mark seq as locally handled to avoid false network-gap noise.
+            CoalescedSeq.Add(eventSeq);
+            TryCoalesceHitResolvedLow(ref data, length);
+            PendingLow.Enqueue(new PendingCombatPacket { Data = data, Length = length });
+            if (PendingCombatCount > _maxPendingDepth)
+                _maxPendingDepth = PendingCombatCount;
+            return;
+        }
+        if (TryCoalesceUnitState(ref data, length))
+            return;
+        if (TryCoalesceCrewState(ref data, length))
+            return;
         if (TryCoalesceStruck(ref data, length))
             return;
         if (TryCoalesceDamageState(ref data, length))
             return;
-        Pending.Enqueue(new PendingCombatPacket { Data = data, Length = length });
-        if (Pending.Count > _maxPendingDepth)
-            _maxPendingDepth = Pending.Count;
+        PendingHigh.Enqueue(new PendingCombatPacket { Data = data, Length = length });
+        if (PendingCombatCount > _maxPendingDepth)
+            _maxPendingDepth = PendingCombatCount;
     }
 
     private static bool TryCoalesceStruck(ref byte[] data, int length)
@@ -119,14 +149,14 @@ internal static class ClientCombatApplier
             return false;
         }
 
-        int count = Pending.Count;
+        int count = PendingHigh.Count;
         if (count == 0)
             return false;
         var rebuilt = new Queue<PendingCombatPacket>(count);
         bool removedAny = false;
-        while (Pending.Count > 0)
+        while (PendingHigh.Count > 0)
         {
-            PendingCombatPacket p = Pending.Dequeue();
+            PendingCombatPacket p = PendingHigh.Dequeue();
             if (!CoopCombatPacket.TryRead(p.Data, p.Length, out byte queuedType, out uint queuedSeq, out _, out _)
                 || queuedType != CoopCombatPacket.EventUnitStruck)
             {
@@ -157,11 +187,11 @@ internal static class ClientCombatApplier
         }
 
         while (rebuilt.Count > 0)
-            Pending.Enqueue(rebuilt.Dequeue());
+            PendingHigh.Enqueue(rebuilt.Dequeue());
 
-        Pending.Enqueue(new PendingCombatPacket { Data = data, Length = length });
-        if (Pending.Count > _maxPendingDepth)
-            _maxPendingDepth = Pending.Count;
+        PendingHigh.Enqueue(new PendingCombatPacket { Data = data, Length = length });
+        if (PendingCombatCount > _maxPendingDepth)
+            _maxPendingDepth = PendingCombatCount;
         if (removedAny)
             CoalescedSeq.Remove(incomingSeq);
         return true;
@@ -185,14 +215,14 @@ internal static class ClientCombatApplier
             return false;
         }
 
-        int count = Pending.Count;
+        int count = PendingHigh.Count;
         if (count == 0)
             return false;
         var rebuilt = new Queue<PendingCombatPacket>(count);
         bool removedAny = false;
-        while (Pending.Count > 0)
+        while (PendingHigh.Count > 0)
         {
-            PendingCombatPacket p = Pending.Dequeue();
+            PendingCombatPacket p = PendingHigh.Dequeue();
             if (!CoopCombatPacket.TryRead(p.Data, p.Length, out byte queuedType, out uint queuedSeq, out _, out _)
                 || queuedType != CoopCombatPacket.EventDamageState)
             {
@@ -220,19 +250,147 @@ internal static class ClientCombatApplier
         }
 
         while (rebuilt.Count > 0)
-            Pending.Enqueue(rebuilt.Dequeue());
+            PendingHigh.Enqueue(rebuilt.Dequeue());
 
-        Pending.Enqueue(new PendingCombatPacket { Data = data, Length = length });
-        if (Pending.Count > _maxPendingDepth)
-            _maxPendingDepth = Pending.Count;
+        PendingHigh.Enqueue(new PendingCombatPacket { Data = data, Length = length });
+        if (PendingCombatCount > _maxPendingDepth)
+            _maxPendingDepth = PendingCombatCount;
         if (removedAny)
             CoalescedSeq.Remove(incomingSeq);
         return true;
     }
 
+    private static bool TryCoalesceUnitState(ref byte[] data, int length)
+    {
+        if (!CoopCombatPacket.TryRead(data, length, out byte eventType, out uint incomingSeq, out _, out _))
+            return false;
+        if (eventType != CoopCombatPacket.EventUnitState)
+            return false;
+        if (!CoopCombatPacket.TryReadUnitState(data, length, out _, out _, out _, out uint incomingUnitNetId, out _))
+            return false;
+        return CoalesceByUnitNetId(ref data, length, incomingSeq, CoopCombatPacket.EventUnitState, incomingUnitNetId);
+    }
+
+    private static bool TryCoalesceCrewState(ref byte[] data, int length)
+    {
+        if (!CoopCombatPacket.TryRead(data, length, out byte eventType, out uint incomingSeq, out _, out _))
+            return false;
+        if (eventType != CoopCombatPacket.EventCrewState)
+            return false;
+        if (!CoopCombatPacket.TryReadCrewState(data, length, out _, out _, out _, out uint incomingUnitNetId, out _))
+            return false;
+        return CoalesceByUnitNetId(ref data, length, incomingSeq, CoopCombatPacket.EventCrewState, incomingUnitNetId);
+    }
+
+    private static bool CoalesceByUnitNetId(ref byte[] data, int length, uint incomingSeq, byte targetEventType, uint incomingUnitNetId)
+    {
+        int count = PendingHigh.Count;
+        if (count == 0)
+            return false;
+        var rebuilt = new Queue<PendingCombatPacket>(count);
+        bool removedAny = false;
+        while (PendingHigh.Count > 0)
+        {
+            PendingCombatPacket p = PendingHigh.Dequeue();
+            if (!CoopCombatPacket.TryRead(p.Data, p.Length, out byte queuedType, out uint queuedSeq, out _, out _)
+                || queuedType != targetEventType)
+            {
+                rebuilt.Enqueue(p);
+                continue;
+            }
+
+            uint queuedUnit = 0;
+            bool parsed = targetEventType switch
+            {
+                CoopCombatPacket.EventUnitState => CoopCombatPacket.TryReadUnitState(p.Data, p.Length, out _, out _, out _, out queuedUnit, out _),
+                CoopCombatPacket.EventCrewState => CoopCombatPacket.TryReadCrewState(p.Data, p.Length, out _, out _, out _, out queuedUnit, out _),
+                _ => false
+            };
+            if (!parsed || queuedUnit != incomingUnitNetId)
+            {
+                rebuilt.Enqueue(p);
+                continue;
+            }
+
+            removedAny = true;
+            CoalescedSeq.Add(queuedSeq);
+        }
+
+        while (rebuilt.Count > 0)
+            PendingHigh.Enqueue(rebuilt.Dequeue());
+
+        PendingHigh.Enqueue(new PendingCombatPacket { Data = data, Length = length });
+        if (PendingCombatCount > _maxPendingDepth)
+            _maxPendingDepth = PendingCombatCount;
+        if (removedAny)
+            CoalescedSeq.Remove(incomingSeq);
+        return true;
+    }
+
+    private static void TryCoalesceHitResolvedLow(ref byte[] data, int length)
+    {
+        if (!CoopCombatPacket.TryReadHitResolved(
+                data,
+                length,
+                out _,
+                out _,
+                out _,
+                out _,
+                out uint incomingVictim,
+                out _,
+                out _,
+                out _,
+                out _,
+                out _))
+        {
+            return;
+        }
+
+        int count = PendingLow.Count;
+        if (count == 0)
+            return;
+        var rebuilt = new Queue<PendingCombatPacket>(count);
+        while (PendingLow.Count > 0)
+        {
+            PendingCombatPacket p = PendingLow.Dequeue();
+            if (!CoopCombatPacket.TryRead(p.Data, p.Length, out byte queuedType, out uint queuedSeq, out _, out _)
+                || queuedType != CoopCombatPacket.EventHitResolved)
+            {
+                rebuilt.Enqueue(p);
+                continue;
+            }
+
+            if (!CoopCombatPacket.TryReadHitResolved(
+                    p.Data,
+                    p.Length,
+                    out _,
+                    out _,
+                    out _,
+                    out _,
+                    out uint queuedVictim,
+                    out _,
+                    out _,
+                    out _,
+                    out _,
+                    out _)
+                || queuedVictim != incomingVictim)
+            {
+                rebuilt.Enqueue(p);
+                continue;
+            }
+
+            // Replaced by newer HitResolved for same victim in low queue.
+            CoalescedSeq.Add(queuedSeq);
+        }
+
+        while (rebuilt.Count > 0)
+            PendingLow.Enqueue(rebuilt.Dequeue());
+    }
+
     /// <summary>Apply up to <paramref name="maxPackets" /> events and/or within <paramref name="maxMs" /> wall time. 0 = unlimited.</summary>
     public static void DrainPendingCombat(
         int maxPackets,
+        int maxLowPriorityPackets,
         float maxMs,
         bool logFired,
         bool logStruckPerHit,
@@ -242,7 +400,8 @@ internal static class ClientCombatApplier
     {
         if (!CoopSessionState.IsPlaying)
         {
-            Pending.Clear();
+            PendingHigh.Clear();
+            PendingLow.Clear();
             return;
         }
 
@@ -252,7 +411,7 @@ internal static class ClientCombatApplier
         bool hitCountBudget = false;
         bool hitTimeBudget = false;
         Stopwatch? sw = capTime ? Stopwatch.StartNew() : null;
-        while (Pending.Count > 0)
+        while (PendingHigh.Count > 0)
         {
             if (capCount && applied >= maxPackets)
             {
@@ -264,22 +423,45 @@ internal static class ClientCombatApplier
                 hitTimeBudget = true;
                 break;
             }
-            PendingCombatPacket p = Pending.Dequeue();
+            PendingCombatPacket p = PendingHigh.Dequeue();
             TryApplyPacket(p.Data, p.Length, logFired, logStruckPerHit, logImpactFx, logDamageState, logHealth);
             applied++;
+        }
+
+        int lowCap = maxLowPriorityPackets < 0 ? 0 : maxLowPriorityPackets;
+        int lowApplied = 0;
+        while (PendingLow.Count > 0)
+        {
+            if (capCount && applied >= maxPackets)
+            {
+                hitCountBudget = true;
+                break;
+            }
+            if (lowCap > 0 && lowApplied >= lowCap)
+                break;
+            if (capTime && sw!.Elapsed.TotalMilliseconds >= maxMs)
+            {
+                hitTimeBudget = true;
+                break;
+            }
+
+            PendingCombatPacket p = PendingLow.Dequeue();
+            TryApplyPacket(p.Data, p.Length, logFired, logStruckPerHit, logImpactFx, logDamageState, logHealth);
+            applied++;
+            lowApplied++;
         }
 
         if (!logHealth)
             return;
 
         float now = Time.time;
-        int pendingDepth = Pending.Count;
+        int pendingDepth = PendingCombatCount;
         if (pendingDepth >= QueuePressureWarnThreshold && now >= _nextQueuePressureLogTime)
         {
             bool critical = pendingDepth >= QueuePressureCriticalThreshold;
             string level = critical ? "CRITICAL" : "WARN";
             MelonLogger.Warning(
-                $"[CoopNet][Health] queue-pressure {level}: pending={pendingDepth} maxSeen={_maxPendingDepth} applied={applied} perFrameCap={maxPackets} msCap={maxMs:0.##}");
+                $"[CoopNet][Health] queue-pressure {level}: pending={pendingDepth} (high={PendingHigh.Count}, low={PendingLow.Count}) maxSeen={_maxPendingDepth} applied={applied} perFrameCap={maxPackets} lowCap={lowCap} msCap={maxMs:0.##}");
             _nextQueuePressureLogTime = now + HealthLogCooldownSeconds;
         }
 
@@ -391,6 +573,67 @@ internal static class ClientCombatApplier
                 TryApplyDamageState(seq, token, phase, victimNetId, state, logDamageState, logHealth);
             }
         }
+        else if (eventType == CoopCombatPacket.EventUnitState)
+        {
+            if (CoopCombatPacket.TryReadUnitState(
+                    data,
+                    length,
+                    out uint seq,
+                    out uint token,
+                    out byte phase,
+                    out uint unitNetId,
+                    out CoopUnitStateSnapshot state))
+            {
+                TryApplyUnitState(seq, token, phase, unitNetId, state, logDamageState, logHealth);
+            }
+        }
+        else if (eventType == CoopCombatPacket.EventCrewState)
+        {
+            if (CoopCombatPacket.TryReadCrewState(
+                    data,
+                    length,
+                    out uint seq,
+                    out uint token,
+                    out byte phase,
+                    out uint unitNetId,
+                    out CoopCrewStateSnapshot state))
+            {
+                TryApplyCrewState(seq, token, phase, unitNetId, state, logDamageState, logHealth);
+            }
+        }
+        else if (eventType == CoopCombatPacket.EventHitResolved)
+        {
+            if (CoopCombatPacket.TryReadHitResolved(
+                    data,
+                    length,
+                    out uint seq,
+                    out uint token,
+                    out byte phase,
+                    out uint shotId,
+                    out uint victimNetId,
+                    out uint shooterNetId,
+                    out uint ammoKey,
+                    out Vector3 impact,
+                    out byte hitKind,
+                    out byte flags))
+            {
+                TryApplyHitResolved(seq, token, phase, shotId, victimNetId, shooterNetId, ammoKey, impact, hitKind, flags, logDamageState, logHealth);
+            }
+        }
+        else if (eventType == CoopCombatPacket.EventCompartmentState)
+        {
+            if (CoopCombatPacket.TryReadCompartmentState(
+                    data,
+                    length,
+                    out uint seq,
+                    out uint token,
+                    out byte phase,
+                    out uint unitNetId,
+                    out CoopCompartmentStateSnapshot state))
+            {
+                TryApplyCompartmentState(seq, token, phase, unitNetId, state, logDamageState, logHealth);
+            }
+        }
         else
         {
             if (!CoopCombatPacket.TryRead(data, length, out _, out uint seqSkip, out uint tokenSkip, out byte phaseSkip))
@@ -432,7 +675,7 @@ internal static class ClientCombatApplier
                 if (logHealth && Time.time >= _nextSeqGapLogTime)
                 {
                     MelonLogger.Warning(
-                        $"[CoopNet][Health] seq-gap event={EventTypeName(eventType)} recv={seq} prev={_lastCombatSeq} gap={networkGap} totalGaps={_seqGapCount} maxGap={_maxSeqGap} pending={Pending.Count} coalesced={(missing - networkGap)}");
+                        $"[CoopNet][Health] seq-gap event={EventTypeName(eventType)} recv={seq} prev={_lastCombatSeq} gap={networkGap} totalGaps={_seqGapCount} maxGap={_maxSeqGap} pending={PendingCombatCount} coalesced={(missing - networkGap)}");
                     _nextSeqGapLogTime = Time.time + HealthLogCooldownSeconds;
                 }
             }
@@ -646,6 +889,123 @@ internal static class ClientCombatApplier
         }
     }
 
+    private static void TryApplyUnitState(
+        uint seq,
+        uint token,
+        byte phase,
+        uint unitNetId,
+        in CoopUnitStateSnapshot state,
+        bool logUnitState,
+        bool logHealth)
+    {
+        if (!AcceptMission(token, phase) || !AcceptSeq(seq, CoopCombatPacket.EventUnitState, logHealth))
+            return;
+        _unitStateRecvCount++;
+        Unit? unit = CoopUnitLookup.TryFindByNetId(unitNetId);
+        if (unit == null)
+        {
+            MelonLogger.Warning($"[CoopNet] GHC UnitState: unit netId={unitNetId} not found");
+            return;
+        }
+
+        try
+        {
+            state.ApplyTo(unit);
+            _unitStateApplyCount++;
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[CoopNet] GHC UnitState apply failed: {ex.Message}");
+            return;
+        }
+
+        if (logUnitState)
+            MelonLogger.Msg($"[CoopNet] GHC recv UnitState seq={seq} unit={unitNetId} flags={state.Flags}");
+    }
+
+    private static void TryApplyCrewState(
+        uint seq,
+        uint token,
+        byte phase,
+        uint unitNetId,
+        in CoopCrewStateSnapshot state,
+        bool logCrewState,
+        bool logHealth)
+    {
+        if (!AcceptMission(token, phase) || !AcceptSeq(seq, CoopCombatPacket.EventCrewState, logHealth))
+            return;
+        _crewStateRecvCount++;
+        Unit? unit = CoopUnitLookup.TryFindByNetId(unitNetId);
+        if (unit == null)
+        {
+            MelonLogger.Warning($"[CoopNet] GHC CrewState: unit netId={unitNetId} not found");
+            return;
+        }
+
+        try
+        {
+            state.ApplyTo(unit);
+            _crewStateApplyCount++;
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[CoopNet] GHC CrewState apply failed: {ex.Message}");
+            return;
+        }
+
+        if (logCrewState)
+        {
+            MelonLogger.Msg(
+                $"[CoopNet] GHC recv CrewState seq={seq} unit={unitNetId} present/dead/incap/evac/susp={state.PresentMask}/{state.DeadMask}/{state.IncapacitatedMask}/{state.EvacuatedMask}/{state.SuspendedMask}");
+        }
+    }
+
+    private static void TryApplyHitResolved(
+        uint seq,
+        uint token,
+        byte phase,
+        uint shotId,
+        uint victimNetId,
+        uint shooterNetId,
+        uint ammoKey,
+        Vector3 impact,
+        byte hitKind,
+        byte flags,
+        bool logHitResolved,
+        bool logHealth)
+    {
+        // Low-priority telemetry event: do not compete with authoritative global seq gate.
+        if (!AcceptMission(token, phase))
+            return;
+        _ = logHealth;
+        _hitResolvedRecvCount++;
+        _ = impact;
+        if (logHitResolved)
+        {
+            MelonLogger.Msg(
+                $"[CoopNet] GHC recv HitResolved seq={seq} shot={shotId} victim={victimNetId} shooter={shooterNetId} ammoKey={ammoKey} hitKind={hitKind} flags={flags}");
+        }
+    }
+
+    private static void TryApplyCompartmentState(
+        uint seq,
+        uint token,
+        byte phase,
+        uint unitNetId,
+        in CoopCompartmentStateSnapshot state,
+        bool logCompartmentState,
+        bool logHealth)
+    {
+        if (!AcceptMission(token, phase) || !AcceptSeq(seq, CoopCombatPacket.EventCompartmentState, logHealth))
+            return;
+        _compartmentStateRecvCount++;
+        if (logCompartmentState)
+        {
+            MelonLogger.Msg(
+                $"[CoopNet] GHC recv CompartmentState seq={seq} unit={unitNetId} fire={state.FirePresent} unsecured={state.UnsecuredFirePresent} flamePct={state.CombinedFlameHeightPct} tempPct={state.InternalTemperaturePct}");
+        }
+    }
+
     private static string EventTypeName(byte eventType)
     {
         return eventType switch
@@ -654,13 +1014,17 @@ internal static class ClientCombatApplier
             CoopCombatPacket.EventUnitStruck => "Struck",
             CoopCombatPacket.EventImpactFx => "ImpactFx",
             CoopCombatPacket.EventDamageState => "DamageState",
+            CoopCombatPacket.EventUnitState => "UnitState",
+            CoopCombatPacket.EventCrewState => "CrewState",
+            CoopCombatPacket.EventHitResolved => "HitResolved",
+            CoopCombatPacket.EventCompartmentState => "CompartmentState",
             _ => "Unknown"
         };
     }
 
     private static void LogSessionSummaryIfAny()
     {
-        int pending = Pending.Count;
+        int pending = PendingCombatCount;
         if (_recvAcceptedCount == 0
             && _seqGapCount == 0
             && _maxPendingDepth == 0
@@ -669,6 +1033,12 @@ internal static class ClientCombatApplier
             && _damageStateApplyFailCount == 0
             && _damageStateRecvCount == 0
             && _damageStateApplyCount == 0
+            && _unitStateRecvCount == 0
+            && _unitStateApplyCount == 0
+            && _crewStateRecvCount == 0
+            && _crewStateApplyCount == 0
+            && _hitResolvedRecvCount == 0
+            && _compartmentStateRecvCount == 0
             && _damageStateCoalescedCount == 0
             && _struckCoalescedCount == 0
             && _damageStateDestroyParityMismatchCount == 0
@@ -684,5 +1054,7 @@ internal static class ClientCombatApplier
             $"[CoopNet][Summary] GHC apply-fail struck={_struckApplyFailCount} impactFx={_impactFxApplyFailCount} damageState={_damageStateApplyFailCount}");
         MelonLogger.Msg(
             $"[CoopNet][Summary] GHC damage-state recv={_damageStateRecvCount} applied={_damageStateApplyCount} coalesced={_damageStateCoalescedCount} destroyParityMismatch={_damageStateDestroyParityMismatchCount} struckCoalesced={_struckCoalescedCount}");
+        MelonLogger.Msg(
+            $"[CoopNet][Summary] GHC unit-state recv={_unitStateRecvCount} applied={_unitStateApplyCount} crew-state recv={_crewStateRecvCount} applied={_crewStateApplyCount} hitResolved recv={_hitResolvedRecvCount} compartment-state recv={_compartmentStateRecvCount}");
     }
 }
