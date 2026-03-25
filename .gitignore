@@ -1,0 +1,11 @@
+bin/
+obj/
+.vs/
+*.user
+*.suo
+Directory.Build.user.props
+artifacts/decompiled/
+lib/MelonLoader/*.dll
+lib/MelonLoader/*.mdb
+lib/MelonLoader/*.pdb
+lib/MelonLoader/*.exe

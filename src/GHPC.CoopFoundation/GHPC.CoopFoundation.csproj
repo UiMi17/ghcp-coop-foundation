@@ -1,0 +1,72 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RootNamespace>GHPC.CoopFoundation</RootNamespace>
+    <AssemblyName>GHPC.CoopFoundation</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <DeployMod>true</DeployMod>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="0Harmony">
+      <HintPath>$(MelonLoaderLibDir)\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MelonLoader">
+      <HintPath>$(MelonLoaderLibDir)\MelonLoader.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MonoMod.RuntimeDetour">
+      <HintPath>$(MelonLoaderLibDir)\MonoMod.RuntimeDetour.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MonoMod.Utils">
+      <HintPath>$(MelonLoaderLibDir)\MonoMod.Utils.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MonoMod.Backports">
+      <HintPath>$(MelonLoaderLibDir)\MonoMod.Backports.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MonoMod.ILHelpers">
+      <HintPath>$(MelonLoaderLibDir)\MonoMod.ILHelpers.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(GHPCManagedDir)\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.PhysicsModule">
+      <HintPath>$(GHPCManagedDir)\UnityEngine.PhysicsModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(GHPCManagedDir)\Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <Target Name="CheckMelonRefs" BeforeTargets="ResolveAssemblyReferences">
+    <Error Text="MelonLoader reference DLLs missing. Run: pwsh tools/fetch-melonloader-libs.ps1"
+           Condition="!Exists('$(MelonLoaderLibDir)\MelonLoader.dll')" />
+    <Error Text="GHPC Managed folder not found (check GHPCGameDir in Directory.Build.props): $(GHPCManagedDir)"
+           Condition="!Exists('$(GHPCManagedDir)\UnityEngine.CoreModule.dll')" />
+  </Target>
+
+  <Target Name="DeployToGameMods" AfterTargets="Build" Condition="'$(DeployMod)' == 'true'">
+    <ItemGroup>
+      <_CoopModsDeployDir Remove="@(_CoopModsDeployDir)" />
+      <_CoopModsDeployDir Include="$(GHPCGameDir)" Condition="Exists('$(GHPCGameDir)\GHPC.exe')" />
+      <_CoopModsDeployDir Include="$(GHPCGameDirSecondary)"
+                          Condition="'$(GHPCGameDirSecondary)' != '' and Exists('$(GHPCGameDirSecondary)\GHPC.exe')" />
+    </ItemGroup>
+    <MakeDir Directories="@(_CoopModsDeployDir->'%(Identity)\Mods')" Condition="'@(_CoopModsDeployDir)' != ''" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="%(_CoopModsDeployDir.Identity)\Mods" SkipUnchangedFiles="true"
+          Condition="'@(_CoopModsDeployDir)' != ''" />
+  </Target>
+</Project>

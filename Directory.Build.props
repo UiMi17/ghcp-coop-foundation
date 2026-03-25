@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <GHPCGameDir>E:\SteamLibrary\steamapps\common\Gunner HEAT PC\Bin</GHPCGameDir>
+    <!-- Second game root (e.g. Steam "duplicate" for Client prefs). Deploy copies DLL to both Mods folders when GHPC.exe exists. Override or clear in Directory.Build.user.props. -->
+    <GHPCGameDirSecondary>E:\SteamLibrary\steamapps\common\Gunner HEAT PC - Copy\Bin</GHPCGameDirSecondary>
+    <GHPCManagedDir>$(GHPCGameDir)\GHPC_Data\Managed</GHPCManagedDir>
+    <MelonLoaderLibDir>$(MSBuildThisFileDirectory)lib\MelonLoader</MelonLoaderLibDir>
+  </PropertyGroup>
+  <Import Project="$(MSBuildThisFileDirectory)Directory.Build.user.props" Condition="Exists('$(MSBuildThisFileDirectory)Directory.Build.user.props')" />
+</Project>
