@@ -9,3 +9,5 @@ lib/MelonLoader/*.dll
 lib/MelonLoader/*.mdb
 lib/MelonLoader/*.pdb
 lib/MelonLoader/*.exe
+*.md
+*.txt

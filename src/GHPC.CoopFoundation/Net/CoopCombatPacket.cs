@@ -35,9 +35,19 @@ internal static class CoopCombatPacket
     /// <summary>Phase 5 P1: compact flammables/compartment critical state.</summary>
     public const byte EventCompartmentState = 8;
 
+    /// <summary>Phase 6: <see cref="GHPC.Effects.ParticleEffectsManager.CreateImpactEffectOfType" /> + simple impact audio.</summary>
+    public const byte EventParticleImpact = 9;
+
+    /// <summary>Phase 6: <see cref="GHPC.Effects.Explosions.RegisterExplosion" /> (visual/listeners).</summary>
+    public const byte EventExplosion = 10;
+
+    /// <summary>Cosmetic AT grenade jet: initial state for client-only ballistic ghost (no damage).</summary>
+    public const byte EventGrenadeJetVisual = 11;
+
     public const int HeaderLength = 16;
 
-    public const int FiredPayloadLength = 36;
+    /// <summary>Includes trailing <c>weaponKey</c> (FNV of weapon GameObject name; 0 = legacy / unknown).</summary>
+    public const int FiredPayloadLength = 40;
 
     public const int StruckPayloadLength = 28;
 
@@ -56,8 +66,17 @@ internal static class CoopCombatPacket
     /// <summary>shotId + victimNetId + shooterNetId + ammoKey + impact + hitKind + flags + 2-byte pad.</summary>
     public const int HitResolvedPayloadLength = 32;
 
-    /// <summary>unitNetId + firePresent + unsecuredFire + combinedFlameHeightPct + internalTempPct + 4-byte pad.</summary>
+    /// <summary>unitNetId + firePresent + unsecuredFire + flamePct + tempPct + scorchPct + smokeColumnPct + 2-byte pad.</summary>
     public const int CompartmentStatePayloadLength = 12;
+
+    /// <summary>ammoKey + pos + forward + surface + fused + category + ricochet + flags + impactAudio + fuzed + pad.</summary>
+    public const int ParticleImpactPayloadLength = 36;
+
+    /// <summary>pos + TNT centi-kg (u16) + flags + pad.</summary>
+    public const int ExplosionPayloadLength = 20;
+
+    /// <summary>ammoKey + shooterNetId + pos + velocity + flags + maxLifeDs + 2-byte pad.</summary>
+    public const int GrenadeJetVisualPayloadLength = 36;
 
     public const int FiredTotalLength = HeaderLength + FiredPayloadLength;
 
@@ -75,8 +94,17 @@ internal static class CoopCombatPacket
 
     public const int CompartmentStateTotalLength = HeaderLength + CompartmentStatePayloadLength;
 
+    public const int ParticleImpactTotalLength = HeaderLength + ParticleImpactPayloadLength;
+
+    public const int ExplosionTotalLength = HeaderLength + ExplosionPayloadLength;
+
+    public const int GrenadeJetVisualTotalLength = HeaderLength + GrenadeJetVisualPayloadLength;
+
     /// <summary>Smallest valid GHC datagram (UnitState).</summary>
     public static int MinCombatDatagramLength => UnitStateTotalLength;
+
+    /// <summary>Legacy Fired total before <c>weaponKey</c> (wire compat).</summary>
+    public const int FiredLegacyTotalLength = HeaderLength + 36;
 
     public static bool IsCoopCombat(byte[] data, int length) =>
         data != null
@@ -94,7 +122,8 @@ internal static class CoopCombatPacket
         uint ammoKey,
         Vector3 muzzle,
         Vector3 direction,
-        uint targetNetId)
+        uint targetNetId,
+        uint weaponNetKey = 0)
     {
         if (buffer.Length < FiredTotalLength)
             throw new ArgumentException("buffer too small", nameof(buffer));
@@ -104,7 +133,8 @@ internal static class CoopCombatPacket
         o = WriteU32(buffer, o, ammoKey);
         o = WriteVec3(buffer, o, muzzle);
         o = WriteVec3(buffer, o, direction);
-        WriteU32(buffer, o, targetNetId);
+        o = WriteU32(buffer, o, targetNetId);
+        WriteU32(buffer, o, weaponNetKey);
         return FiredTotalLength;
     }
 
@@ -282,11 +312,212 @@ internal static class CoopCombatPacket
         buffer[o++] = state.UnsecuredFirePresent ? (byte)1 : (byte)0;
         buffer[o++] = state.CombinedFlameHeightPct;
         buffer[o++] = state.InternalTemperaturePct;
-        buffer[o++] = 0;
-        buffer[o++] = 0;
+        buffer[o++] = state.ScorchPct;
+        buffer[o++] = state.SmokeColumnPct;
         buffer[o++] = 0;
         buffer[o] = 0;
         return CompartmentStateTotalLength;
+    }
+
+    public const byte ExplosionFlagFromCompartment = 1;
+
+    /// <summary>Replicated smoke grenade puff (no TNT); client spawns smoke FX only.</summary>
+    public const byte ExplosionFlagGrenadeSmoke = 2;
+
+    public static int WriteParticleImpact(
+        byte[] buffer,
+        uint hostCombatSeq,
+        uint missionToken,
+        byte missionPhase,
+        uint ammoKey,
+        Vector3 worldPos,
+        Vector3 forward,
+        byte surfaceMaterial,
+        byte fusedStatus,
+        byte category,
+        byte ricochetType,
+        byte flags,
+        byte impactAudioType,
+        bool simpleAudioFuzed)
+    {
+        if (buffer.Length < ParticleImpactTotalLength)
+            throw new ArgumentException("buffer too small", nameof(buffer));
+        WriteHeader(buffer, hostCombatSeq, missionToken, missionPhase, EventParticleImpact);
+        int o = HeaderLength;
+        o = WriteU32(buffer, o, ammoKey);
+        o = WriteVec3(buffer, o, worldPos);
+        o = WriteVec3(buffer, o, forward);
+        buffer[o++] = surfaceMaterial;
+        buffer[o++] = fusedStatus;
+        buffer[o++] = category;
+        buffer[o++] = ricochetType;
+        buffer[o++] = flags;
+        buffer[o++] = impactAudioType;
+        buffer[o++] = (byte)(simpleAudioFuzed ? 1 : 0);
+        buffer[o++] = 0;
+        return ParticleImpactTotalLength;
+    }
+
+    public static int WriteExplosion(
+        byte[] buffer,
+        uint hostCombatSeq,
+        uint missionToken,
+        byte missionPhase,
+        Vector3 worldPos,
+        float tntKg,
+        byte flags)
+    {
+        if (buffer.Length < ExplosionTotalLength)
+            throw new ArgumentException("buffer too small", nameof(buffer));
+        WriteHeader(buffer, hostCombatSeq, missionToken, missionPhase, EventExplosion);
+        int o = HeaderLength;
+        o = WriteVec3(buffer, o, worldPos);
+        float clamped = tntKg;
+        if (clamped < 0f)
+            clamped = 0f;
+        if (clamped > 655.35f)
+            clamped = 655.35f;
+        ushort centi = (ushort)(clamped * 100f + 0.5f);
+        o = WriteU16(buffer, o, centi);
+        buffer[o++] = flags;
+        buffer[o++] = 0;
+        buffer[o++] = 0;
+        buffer[o++] = 0;
+        buffer[o++] = 0;
+        return ExplosionTotalLength;
+    }
+
+    public const byte GrenadeJetFlagGravity = 1;
+
+    public static int WriteGrenadeJetVisual(
+        byte[] buffer,
+        uint hostCombatSeq,
+        uint missionToken,
+        byte missionPhase,
+        uint ammoKey,
+        uint shooterNetId,
+        Vector3 worldPos,
+        Vector3 velocity,
+        bool useGravity,
+        byte maxLifeDs)
+    {
+        if (buffer.Length < GrenadeJetVisualTotalLength)
+            throw new ArgumentException("buffer too small", nameof(buffer));
+        WriteHeader(buffer, hostCombatSeq, missionToken, missionPhase, EventGrenadeJetVisual);
+        int o = HeaderLength;
+        o = WriteU32(buffer, o, ammoKey);
+        o = WriteU32(buffer, o, shooterNetId);
+        o = WriteVec3(buffer, o, worldPos);
+        o = WriteVec3(buffer, o, velocity);
+        buffer[o++] = (byte)(useGravity ? GrenadeJetFlagGravity : 0);
+        buffer[o++] = maxLifeDs;
+        buffer[o++] = 0;
+        buffer[o] = 0;
+        return GrenadeJetVisualTotalLength;
+    }
+
+    public static bool TryReadParticleImpact(
+        byte[] data,
+        int length,
+        out uint hostCombatSeq,
+        out uint missionToken,
+        out byte missionPhase,
+        out uint ammoKey,
+        out Vector3 worldPos,
+        out Vector3 forward,
+        out byte surfaceMaterial,
+        out byte fusedStatus,
+        out byte category,
+        out byte ricochetType,
+        out byte flags,
+        out byte impactAudioType,
+        out bool simpleAudioFuzed)
+    {
+        ammoKey = 0;
+        worldPos = default;
+        forward = default;
+        surfaceMaterial = 0;
+        fusedStatus = 0;
+        category = 0;
+        ricochetType = 0;
+        flags = 0;
+        impactAudioType = 0;
+        simpleAudioFuzed = false;
+        if (!TryRead(data, length, out byte et, out hostCombatSeq, out missionToken, out missionPhase))
+            return false;
+        if (et != EventParticleImpact || length < ParticleImpactTotalLength)
+            return false;
+        int o = HeaderLength;
+        ammoKey = ReadU32(data, ref o);
+        worldPos = ReadVec3(data, ref o);
+        forward = ReadVec3(data, ref o);
+        surfaceMaterial = data[o++];
+        fusedStatus = data[o++];
+        category = data[o++];
+        ricochetType = data[o++];
+        flags = data[o++];
+        impactAudioType = data[o++];
+        simpleAudioFuzed = data[o++] != 0;
+        return true;
+    }
+
+    public static bool TryReadExplosion(
+        byte[] data,
+        int length,
+        out uint hostCombatSeq,
+        out uint missionToken,
+        out byte missionPhase,
+        out Vector3 worldPos,
+        out float tntKg,
+        out byte flags)
+    {
+        worldPos = default;
+        tntKg = 0f;
+        flags = 0;
+        if (!TryRead(data, length, out byte et, out hostCombatSeq, out missionToken, out missionPhase))
+            return false;
+        if (et != EventExplosion || length < ExplosionTotalLength)
+            return false;
+        int o = HeaderLength;
+        worldPos = ReadVec3(data, ref o);
+        ushort centi = ReadU16(data, ref o);
+        tntKg = centi / 100f;
+        flags = data[o];
+        return true;
+    }
+
+    public static bool TryReadGrenadeJetVisual(
+        byte[] data,
+        int length,
+        out uint hostCombatSeq,
+        out uint missionToken,
+        out byte missionPhase,
+        out uint ammoKey,
+        out uint shooterNetId,
+        out Vector3 worldPos,
+        out Vector3 velocity,
+        out bool useGravity,
+        out byte maxLifeDs)
+    {
+        ammoKey = 0;
+        shooterNetId = 0;
+        worldPos = default;
+        velocity = default;
+        useGravity = false;
+        maxLifeDs = 0;
+        if (!TryRead(data, length, out byte et, out hostCombatSeq, out missionToken, out missionPhase))
+            return false;
+        if (et != EventGrenadeJetVisual || length < GrenadeJetVisualTotalLength)
+            return false;
+        int o = HeaderLength;
+        ammoKey = ReadU32(data, ref o);
+        shooterNetId = ReadU32(data, ref o);
+        worldPos = ReadVec3(data, ref o);
+        velocity = ReadVec3(data, ref o);
+        byte flags = data[o++];
+        useGravity = (flags & GrenadeJetFlagGravity) != 0;
+        maxLifeDs = data[o++];
+        return true;
     }
 
     public static bool TryRead(byte[] data, int length, out byte eventType, out uint hostCombatSeq, out uint missionToken, out byte missionPhase)
@@ -306,16 +537,28 @@ internal static class CoopCombatPacket
         return true;
     }
 
-    public static bool TryReadFired(byte[] data, int length, out uint hostCombatSeq, out uint missionToken, out byte missionPhase, out uint shooterNetId, out uint ammoKey, out Vector3 muzzle, out Vector3 direction, out uint targetNetId)
+    public static bool TryReadFired(
+        byte[] data,
+        int length,
+        out uint hostCombatSeq,
+        out uint missionToken,
+        out byte missionPhase,
+        out uint shooterNetId,
+        out uint ammoKey,
+        out Vector3 muzzle,
+        out Vector3 direction,
+        out uint targetNetId,
+        out uint weaponNetKey)
     {
         shooterNetId = 0;
         ammoKey = 0;
         muzzle = default;
         direction = default;
         targetNetId = 0;
+        weaponNetKey = 0;
         if (!TryRead(data, length, out byte et, out hostCombatSeq, out missionToken, out missionPhase))
             return false;
-        if (et != EventWeaponFired || length < FiredTotalLength)
+        if (et != EventWeaponFired || length < FiredLegacyTotalLength)
             return false;
         int o = HeaderLength;
         shooterNetId = ReadU32(data, ref o);
@@ -323,6 +566,8 @@ internal static class CoopCombatPacket
         muzzle = ReadVec3(data, ref o);
         direction = ReadVec3(data, ref o);
         targetNetId = ReadU32(data, ref o);
+        if (length >= FiredTotalLength)
+            weaponNetKey = ReadU32(data, ref o);
         return true;
     }
 
@@ -516,8 +761,10 @@ internal static class CoopCombatPacket
         bool firePresent = data[o++] != 0;
         bool unsecured = data[o++] != 0;
         byte flamePct = data[o++];
-        byte tempPct = data[o];
-        state = new CoopCompartmentStateSnapshot(firePresent, unsecured, flamePct, tempPct);
+        byte tempPct = data[o++];
+        byte scorchPct = data[o++];
+        byte smokePct = data[o++];
+        state = new CoopCompartmentStateSnapshot(firePresent, unsecured, flamePct, tempPct, scorchPct, smokePct);
         return true;
     }
 

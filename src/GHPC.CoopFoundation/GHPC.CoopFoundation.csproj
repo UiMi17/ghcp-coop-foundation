@@ -45,8 +45,16 @@
       <HintPath>$(GHPCManagedDir)\UnityEngine.PhysicsModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="UnityEngine.ParticleSystemModule">
+      <HintPath>$(GHPCManagedDir)\UnityEngine.ParticleSystemModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="Assembly-CSharp">
       <HintPath>$(GHPCManagedDir)\Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="FMODUnity">
+      <HintPath>$(GHPCManagedDir)\FMODUnity.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>
@@ -56,6 +64,8 @@
            Condition="!Exists('$(MelonLoaderLibDir)\MelonLoader.dll')" />
     <Error Text="GHPC Managed folder not found (check GHPCGameDir in Directory.Build.props): $(GHPCManagedDir)"
            Condition="!Exists('$(GHPCManagedDir)\UnityEngine.CoreModule.dll')" />
+    <Error Text="FMODUnity.dll missing in GHPC Managed (required for remote burning audio): $(GHPCManagedDir)"
+           Condition="!Exists('$(GHPCManagedDir)\FMODUnity.dll')" />
   </Target>
 
   <Target Name="DeployToGameMods" AfterTargets="Build" Condition="'$(DeployMod)' == 'true'">

@@ -1,4 +1,5 @@
 using GHPC.CoopFoundation.Net;
+using GHPC.CoopFoundation.Patches;
 using MelonLoader;
 using UnityEngine;
 
@@ -135,6 +136,49 @@ public sealed class CoopFoundationMod : MelonMod
     private static readonly MelonPreferences_Entry<bool> LogDamageState =
         PrefCategory.CreateEntry("LogDamageState", false);
 
+    /// <summary>Phase 6: skip local LiveRound/SimpleRound impact SFX+particles for other shooters (host sends GHC cosmetics).</summary>
+    private static readonly MelonPreferences_Entry<bool> ClientSuppressRemoteShooterCosmetics =
+        PrefCategory.CreateEntry("ClientSuppressRemoteShooterCosmetics", true);
+
+    /// <summary>Phase 6: host sends <c>ParticleImpact</c> GHC (requires combat replication).</summary>
+    private static readonly MelonPreferences_Entry<bool> ParticleImpactReplicationEnabled =
+        PrefCategory.CreateEntry("ParticleImpactReplicationEnabled", true);
+
+    /// <summary>Phase 6: host sends <c>Explosion</c> GHC.</summary>
+    private static readonly MelonPreferences_Entry<bool> ExplosionReplicationEnabled =
+        PrefCategory.CreateEntry("ExplosionReplicationEnabled", true);
+
+    /// <summary>Phase 6: client replays muzzle VFX from <c>WeaponFired</c> for remote shooters.</summary>
+    private static readonly MelonPreferences_Entry<bool> MuzzleCosmeticReplayEnabled =
+        PrefCategory.CreateEntry("MuzzleCosmeticReplayEnabled", true);
+
+    /// <summary>Host: drop cosmetic UDP sends beyond this distance (m) from main camera or remote ghost (0 = unlimited).</summary>
+    private static readonly MelonPreferences_Entry<float> CosmeticInterestMaxDistanceMeters =
+        PrefCategory.CreateEntry("CosmeticInterestMaxDistanceMeters", 0f);
+
+    /// <summary>Client: min TNT equivalent (kg) from replicated explosion to trigger camera shake/blur.</summary>
+    private static readonly MelonPreferences_Entry<float> ExplosionCameraMinTntKg =
+        PrefCategory.CreateEntry("ExplosionCameraMinTntKg", 0.01f);
+
+    /// <summary>Host: GHC frag Explosion TNT from <see cref="GHPC.Weaponry.AntiPersonnelGrenade" /> serialized radius (linear vs ~6 m → 0.22 kg).</summary>
+    private static readonly MelonPreferences_Entry<bool> FragGrenadeCosmeticTntUseApRadius =
+        PrefCategory.CreateEntry("FragGrenadeCosmeticTntUseApRadius", true);
+
+    /// <summary>Host: fixed TNT kg for frag GHC when radius mapping is off or unreadable.</summary>
+    private static readonly MelonPreferences_Entry<float> FragGrenadeCosmeticTntFallbackKg =
+        PrefCategory.CreateEntry("FragGrenadeCosmeticTntFallbackKg", 0.22f);
+
+    /// <summary>Host→client: GHC cosmetic ballistic ghost for AT grenade jets (no local LiveRound on peer).</summary>
+    private static readonly MelonPreferences_Entry<bool> AtGrenadeJetVisualReplicationEnabled =
+        PrefCategory.CreateEntry("AtGrenadeJetVisualReplicationEnabled", true);
+
+    private static readonly MelonPreferences_Entry<float> ExplosionCameraMaxDistanceMeters =
+        PrefCategory.CreateEntry("ExplosionCameraMaxDistanceMeters", 400f);
+
+    /// <summary>With <c>LogCombatReplication</c>: log cosmetic drop counters (throttled).</summary>
+    private static readonly MelonPreferences_Entry<bool> LogCosmeticHealth =
+        PrefCategory.CreateEntry("LogCosmeticHealth", false);
+
     /// <summary>Phase 5: correction-first governor for non-local client units.</summary>
     private static readonly MelonPreferences_Entry<bool> ClientSimulationSuppressionEnabled =
         PrefCategory.CreateEntry("ClientSimulationSuppressionEnabled", true);
@@ -170,7 +214,7 @@ public sealed class CoopFoundationMod : MelonMod
         LoggerInstance.Msg(
             $"GHPC Coop Foundation {CoopModMetadata.Version} — Harmony patches applied ({HarmonyId}).");
         LoggerInstance.Msg(
-            "Network: UDP GHP v3 + GHW world + GHC combat (+ ImpactFx + DamageState correction); COO session; vehicle ownership; remote ghost + world proxies; phase5 correction governor.");
+            "Network: UDP GHP v3 + GHW world + GHC combat (+ ImpactFx + ParticleImpact + Explosion + muzzle replay + DamageState); COO; phase5 governor; phase6 cosmetic channel.");
 
         CoopUdpTransport.ConfigureAndStart(
             NetworkEnabled.Value,
@@ -186,6 +230,7 @@ public sealed class CoopFoundationMod : MelonMod
 
     public override void OnUpdate()
     {
+        PatchSimpleRoundCoopCosmetic.TryApply(_harmony);
         CoopUdpTransport.SetWorldReplicationPrefs(
             WorldReplicationEnabled.Value,
             WorldReplicationHz.Value,
@@ -203,6 +248,19 @@ public sealed class CoopFoundationMod : MelonMod
             HitResolvedApplyMaxPerFrame.Value);
         CoopUdpTransport.SetImpactFxReplicationPrefs(ImpactFxReplicationEnabled.Value, LogImpactFx.Value);
         CoopUdpTransport.SetDamageStateReplicationPrefs(DamageStateReplicationEnabled.Value, LogDamageState.Value);
+        CoopUdpTransport.SetCosmeticReplicationPrefs(
+            ClientSuppressRemoteShooterCosmetics.Value,
+            ParticleImpactReplicationEnabled.Value,
+            ExplosionReplicationEnabled.Value,
+            MuzzleCosmeticReplayEnabled.Value,
+            CosmeticInterestMaxDistanceMeters.Value,
+            ExplosionCameraMinTntKg.Value,
+            ExplosionCameraMaxDistanceMeters.Value,
+            LogCosmeticHealth.Value,
+            FragGrenadeCosmeticTntUseApRadius.Value,
+            FragGrenadeCosmeticTntFallbackKg.Value,
+            AtGrenadeJetVisualReplicationEnabled.Value);
+        CoopCosmeticHealthCounters.TickLogIfDue();
         ClientSimulationGovernor.Configure(
             ClientSimulationSuppressionEnabled.Value,
             ClientSimulationCorrectionStrength.Value,
@@ -227,6 +285,7 @@ public sealed class CoopFoundationMod : MelonMod
         if (CoopUdpTransport.IsHost)
             HostCombatBroadcast.FlushPendingHitResolved(CoopUdpTransport.CombatReplicationLogDamageState);
         ClientSimulationGovernor.TickLateUpdate(Time.deltaTime);
+        CoopAtJetVisualReplay.Tick(Time.deltaTime);
         RemoteGhostService.TickLateUpdate(ShowRemoteGhost.Value, RemoteGhostSmoothing.Value, RemoteGhostYOffset.Value);
         ClientWorldProxyService.TickLateUpdate(
             ShowWorldProxies.Value,
@@ -244,6 +303,7 @@ public sealed class CoopFoundationMod : MelonMod
 
     public override void OnSceneWasLoaded(int buildIndex, string sceneName)
     {
+        PatchSimpleRoundCoopCosmetic.TryApply(_harmony);
         CoopSessionState.NotifySceneLoaded(sceneName);
         if (!LogSceneLoads.Value)
             return;

@@ -26,12 +26,14 @@ internal static class PatchWeaponSystemFire
         Vector3 muzzle = mz != null ? mz.position : unit.transform.position;
         Vector3 direction = mz != null ? mz.forward : unit.transform.forward;
         uint targetNetId = CoopGhcFiredContext.ResolveTargetNetId(unit, target);
+        uint weaponKey = CoopWeaponKey.FromWeaponSystem(__instance);
         HostCombatBroadcast.TrySendWeaponFired(
             shooterNetId,
             ammoKey,
             muzzle,
             direction,
             targetNetId,
+            weaponKey,
             CoopUdpTransport.CombatReplicationLogFired);
     }
 }

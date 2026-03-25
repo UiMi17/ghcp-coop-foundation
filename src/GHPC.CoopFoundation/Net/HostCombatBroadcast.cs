@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using GHPC;
+using GHPC.Weaponry;
+using GHPC.Weapons;
 using MelonLoader;
 using UnityEngine;
 
@@ -56,6 +58,7 @@ internal static class HostCombatBroadcast
         Vector3 muzzle,
         Vector3 direction,
         uint targetNetId,
+        uint weaponNetKey,
         bool logFired)
     {
         if (!CanEmit)
@@ -73,11 +76,12 @@ internal static class HostCombatBroadcast
             ammoKey,
             muzzle,
             direction,
-            targetNetId);
+            targetNetId,
+            weaponNetKey);
         if (CoopUdpTransport.TryHostSendCombat(_buffer!, len) && logFired)
         {
             MelonLogger.Msg(
-                $"[CoopNet] GHC send Fired seq={seq} shooter={shooterNetId} ammoKey={ammoKey} target={targetNetId}");
+                $"[CoopNet] GHC send Fired seq={seq} shooter={shooterNetId} ammoKey={ammoKey} target={targetNetId} weaponKey={weaponNetKey}");
         }
     }
 
@@ -146,6 +150,115 @@ internal static class HostCombatBroadcast
         {
             MelonLogger.Msg(
                 $"[CoopNet] GHC send ImpactFx seq={seq} kind={effectKind} ammoKey={ammoKey} victim={victimNetId} flags={flags}");
+        }
+    }
+
+    public static void TrySendParticleImpact(
+        uint ammoKey,
+        Vector3 worldPos,
+        Vector3 forward,
+        byte surfaceMaterial,
+        byte fusedStatus,
+        byte category,
+        byte ricochetType,
+        byte flags,
+        byte impactAudioType,
+        bool simpleAudioFuzed,
+        bool logCosmetic)
+    {
+        if (!CanEmit || !CoopUdpTransport.IsHostParticleImpactReplicationActive)
+            return;
+        if (ammoKey == 0)
+            return;
+        EnsureBuffer();
+        uint seq = CoopUdpTransport.TakeNextHostCombatSeq();
+        uint token = CoopSessionState.MissionCoherenceToken;
+        byte phase = CoopSessionState.MissionStateToWirePhase();
+        int len = CoopCombatPacket.WriteParticleImpact(
+            _buffer!,
+            seq,
+            token,
+            phase,
+            ammoKey,
+            worldPos,
+            forward,
+            surfaceMaterial,
+            fusedStatus,
+            category,
+            ricochetType,
+            flags,
+            impactAudioType,
+            simpleAudioFuzed);
+        if (CoopUdpTransport.TryHostSendCombat(_buffer!, len) && logCosmetic)
+        {
+            MelonLogger.Msg(
+                $"[CoopNet] GHC send ParticleImpact seq={seq} ammoKey={ammoKey} surf={surfaceMaterial} fuse={fusedStatus}");
+        }
+    }
+
+    public static void TrySendExplosion(Vector3 worldPos, float tntKg, byte flags, bool logCosmetic)
+    {
+        if (!CanEmit || !CoopUdpTransport.IsHostExplosionReplicationActive)
+            return;
+        EnsureBuffer();
+        uint seq = CoopUdpTransport.TakeNextHostCombatSeq();
+        uint token = CoopSessionState.MissionCoherenceToken;
+        byte phase = CoopSessionState.MissionStateToWirePhase();
+        int len = CoopCombatPacket.WriteExplosion(_buffer!, seq, token, phase, worldPos, tntKg, flags);
+        if (CoopUdpTransport.TryHostSendCombat(_buffer!, len) && logCosmetic)
+        {
+            MelonLogger.Msg($"[CoopNet] GHC send Explosion seq={seq} tnt={tntKg:F2} flags={flags}");
+        }
+    }
+
+    public static void TrySendGrenadeJetVisual(
+        Grenade grenade,
+        LiveRound liveRound,
+        bool logCosmetic)
+    {
+        if (!CanEmit || !CoopUdpTransport.IsHostAtGrenadeJetVisualActive)
+            return;
+        if (grenade == null || liveRound == null || liveRound.Info == null)
+            return;
+        Unit? owner = grenade.Owner;
+        if (owner == null)
+            return;
+        uint shooterNetId = CoopUnitWireRegistry.GetWireId(owner);
+        if (shooterNetId == 0)
+            return;
+        uint ammoKey = CoopAmmoKey.FromAmmoType(liveRound.Info);
+        if (ammoKey == 0)
+            return;
+        Vector3 pos = liveRound.transform.position;
+        if (!CoopCosmeticInterest.ShouldEmitToPeer(pos))
+            return;
+        Vector3 vel = liveRound.transform.forward * liveRound.CurrentSpeed;
+        bool useGravity = liveRound.UseGravity;
+        float speed = liveRound.CurrentSpeed;
+        float gy = Mathf.Abs(Physics.gravity.y);
+        float estLife = useGravity && gy > 0.01f
+            ? Mathf.Clamp(2.2f * speed / gy, 1f, 12f)
+            : Mathf.Clamp(speed / 80f + 1.5f, 2f, 10f);
+        byte maxLifeDs = (byte)Mathf.Clamp(Mathf.RoundToInt(estLife * 10f), 10, 120);
+        EnsureBuffer();
+        uint seq = CoopUdpTransport.TakeNextHostCombatSeq();
+        uint token = CoopSessionState.MissionCoherenceToken;
+        byte phase = CoopSessionState.MissionStateToWirePhase();
+        int len = CoopCombatPacket.WriteGrenadeJetVisual(
+            _buffer!,
+            seq,
+            token,
+            phase,
+            ammoKey,
+            shooterNetId,
+            pos,
+            vel,
+            useGravity,
+            maxLifeDs);
+        if (CoopUdpTransport.TryHostSendCombat(_buffer!, len) && logCosmetic)
+        {
+            MelonLogger.Msg(
+                $"[CoopNet] GHC send GrenadeJetVisual seq={seq} shooter={shooterNetId} ammoKey={ammoKey} grav={useGravity} lifeDs={maxLifeDs}");
         }
     }
 
@@ -383,7 +496,7 @@ internal static class HostCombatBroadcast
         bool hasNext = NextCompartmentStateSendTimeByNetId.TryGetValue(unitNetId, out float nextTime);
         bool hasLast = LastCompartmentStateByNetId.TryGetValue(unitNetId, out CoopCompartmentStateSnapshot last);
         bool changed = !hasLast || !snap.NearlyEquals(last);
-        if (!changed)
+        if (!changed && !force)
             return;
         if (!force && hasNext && now < nextTime)
             return;
@@ -404,7 +517,7 @@ internal static class HostCombatBroadcast
         if (logState)
         {
             MelonLogger.Msg(
-                $"[CoopNet] GHC send CompartmentState seq={seq} unit={unitNetId} fire={snap.FirePresent} unsecured={snap.UnsecuredFirePresent} flamePct={snap.CombinedFlameHeightPct} tempPct={snap.InternalTemperaturePct}");
+                $"[CoopNet] GHC send CompartmentState seq={seq} unit={unitNetId} fire={snap.FirePresent} unsecured={snap.UnsecuredFirePresent} flamePct={snap.CombinedFlameHeightPct} tempPct={snap.InternalTemperaturePct} scorch={snap.ScorchPct} smokeCol={snap.SmokeColumnPct}");
         }
     }
 
@@ -425,17 +538,23 @@ internal static class HostCombatBroadcast
 
     private static void EnsureBuffer()
     {
-        int need = Math.Max(
+        int need = 0;
+        int[] lengths =
+        {
             CoopCombatPacket.FiredTotalLength,
-            Math.Max(
-                CoopCombatPacket.StruckTotalLength,
-                Math.Max(
-                    CoopCombatPacket.ImpactFxTotalLength,
-                    Math.Max(
-                        CoopCombatPacket.DamageStateTotalLength,
-                        Math.Max(
-                            CoopCombatPacket.UnitStateTotalLength,
-                            Math.Max(CoopCombatPacket.CrewStateTotalLength, Math.Max(CoopCombatPacket.HitResolvedTotalLength, CoopCombatPacket.CompartmentStateTotalLength)))))));
+            CoopCombatPacket.StruckTotalLength,
+            CoopCombatPacket.ImpactFxTotalLength,
+            CoopCombatPacket.DamageStateTotalLength,
+            CoopCombatPacket.UnitStateTotalLength,
+            CoopCombatPacket.CrewStateTotalLength,
+            CoopCombatPacket.HitResolvedTotalLength,
+            CoopCombatPacket.CompartmentStateTotalLength,
+            CoopCombatPacket.ParticleImpactTotalLength,
+            CoopCombatPacket.ExplosionTotalLength,
+            CoopCombatPacket.GrenadeJetVisualTotalLength
+        };
+        foreach (int len in lengths)
+            need = Math.Max(need, len);
         if (_buffer == null || _buffer.Length < need)
             _buffer = new byte[need];
     }

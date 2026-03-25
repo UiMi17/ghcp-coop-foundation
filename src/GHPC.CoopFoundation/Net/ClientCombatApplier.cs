@@ -4,6 +4,8 @@ using System.Diagnostics;
 using GHPC;
 using GHPC.AI.Interfaces;
 using GHPC.Audio;
+using GHPC.Effects;
+using GHPC.Player;
 using MelonLoader;
 using UnityEngine;
 
@@ -31,6 +33,10 @@ internal static class ClientCombatApplier
     private static uint _crewStateApplyCount;
     private static uint _hitResolvedRecvCount;
     private static uint _compartmentStateRecvCount;
+    private static uint _particleImpactRecvCount;
+    private static uint _particleImpactApplyFailCount;
+    private static uint _explosionRecvCount;
+    private static readonly Dictionary<uint, bool> LastCompartmentFirePresentByUnitNetId = new();
     private static uint _damageStateCoalescedCount;
     private static uint _struckCoalescedCount;
     private static uint _damageStateDestroyParityMismatchCount;
@@ -74,6 +80,13 @@ internal static class ClientCombatApplier
         _crewStateApplyCount = 0;
         _hitResolvedRecvCount = 0;
         _compartmentStateRecvCount = 0;
+        _particleImpactRecvCount = 0;
+        _particleImpactApplyFailCount = 0;
+        _explosionRecvCount = 0;
+        LastCompartmentFirePresentByUnitNetId.Clear();
+        CoopCompartmentFxReplay.ClearRemoteSmokeColumns();
+        CoopRemoteFlammablesBurningAudio.ClearAll();
+        CoopAtJetVisualReplay.ClearAll();
         _damageStateCoalescedCount = 0;
         _struckCoalescedCount = 0;
         _damageStateDestroyParityMismatchCount = 0;
@@ -498,9 +511,21 @@ internal static class ClientCombatApplier
                     out uint ammoKey,
                     out Vector3 muzzle,
                     out Vector3 direction,
-                    out uint targetNetId))
+                    out uint targetNetId,
+                    out uint weaponNetKey))
             {
-                TryApplyFired(seq, token, phase, shooterNetId, ammoKey, muzzle, direction, targetNetId, logFired, logHealth);
+                TryApplyFired(
+                    seq,
+                    token,
+                    phase,
+                    shooterNetId,
+                    ammoKey,
+                    muzzle,
+                    direction,
+                    targetNetId,
+                    weaponNetKey,
+                    logFired,
+                    logHealth);
             }
         }
         else if (eventType == CoopCombatPacket.EventUnitStruck)
@@ -634,6 +659,90 @@ internal static class ClientCombatApplier
                 TryApplyCompartmentState(seq, token, phase, unitNetId, state, logDamageState, logHealth);
             }
         }
+        else if (eventType == CoopCombatPacket.EventParticleImpact)
+        {
+            if (CoopCombatPacket.TryReadParticleImpact(
+                    data,
+                    length,
+                    out uint seq,
+                    out uint token,
+                    out byte phase,
+                    out uint ammoKey,
+                    out Vector3 worldPos,
+                    out Vector3 forward,
+                    out byte surfaceMaterial,
+                    out byte fusedStatus,
+                    out byte category,
+                    out byte ricochetType,
+                    out byte flags,
+                    out byte impactAudioType,
+                    out bool simpleAudioFuzed))
+            {
+                _ = category;
+                _ = ricochetType;
+                TryApplyParticleImpact(
+                    seq,
+                    token,
+                    phase,
+                    ammoKey,
+                    worldPos,
+                    forward,
+                    surfaceMaterial,
+                    fusedStatus,
+                    category,
+                    ricochetType,
+                    flags,
+                    impactAudioType,
+                    simpleAudioFuzed,
+                    logImpactFx,
+                    logHealth);
+            }
+        }
+        else if (eventType == CoopCombatPacket.EventExplosion)
+        {
+            if (CoopCombatPacket.TryReadExplosion(
+                    data,
+                    length,
+                    out uint seq,
+                    out uint token,
+                    out byte phase,
+                    out Vector3 worldPos,
+                    out float tntKg,
+                    out byte explosionFlags))
+            {
+                _ = explosionFlags;
+                TryApplyExplosion(seq, token, phase, worldPos, tntKg, explosionFlags, logImpactFx, logHealth);
+            }
+        }
+        else if (eventType == CoopCombatPacket.EventGrenadeJetVisual)
+        {
+            if (CoopCombatPacket.TryReadGrenadeJetVisual(
+                    data,
+                    length,
+                    out uint seq,
+                    out uint token,
+                    out byte phase,
+                    out uint ammoKeyJet,
+                    out uint shooterNetIdJet,
+                    out Vector3 jetPos,
+                    out Vector3 jetVel,
+                    out bool jetGrav,
+                    out byte maxLifeDs))
+            {
+                _ = ammoKeyJet;
+                TryApplyGrenadeJetVisual(
+                    seq,
+                    token,
+                    phase,
+                    jetPos,
+                    jetVel,
+                    jetGrav,
+                    maxLifeDs,
+                    shooterNetIdJet,
+                    logImpactFx,
+                    logHealth);
+            }
+        }
         else
         {
             if (!CoopCombatPacket.TryRead(data, length, out _, out uint seqSkip, out uint tokenSkip, out byte phaseSkip))
@@ -694,6 +803,7 @@ internal static class ClientCombatApplier
         Vector3 muzzle,
         Vector3 direction,
         uint targetNetId,
+        uint weaponNetKey,
         bool logFired,
         bool logHealth)
     {
@@ -702,10 +812,11 @@ internal static class ClientCombatApplier
         if (logFired)
         {
             MelonLogger.Msg(
-                $"[CoopNet] GHC recv Fired seq={seq} shooter={shooterNetId} ammoKey={ammoKey} target={targetNetId}");
+                $"[CoopNet] GHC recv Fired seq={seq} shooter={shooterNetId} ammoKey={ammoKey} target={targetNetId} weaponKey={weaponNetKey}");
         }
 
-        // MVP: no full LiveRound; optional future VFX at muzzle (phase 4).
+        CoopMuzzleFxReplay.TryReplay(shooterNetId, ammoKey, weaponNetKey, muzzle, direction);
+        _ = targetNetId;
     }
 
     private static void TryApplyStruck(
@@ -839,6 +950,151 @@ internal static class ClientCombatApplier
         {
             MelonLogger.Msg(
                 $"[CoopNet] GHC recv ImpactFx seq={seq} kind={effectKind} ammoKey={ammoKey} flags={flags}");
+        }
+    }
+
+    private static void TryApplyParticleImpact(
+        uint seq,
+        uint token,
+        byte phase,
+        uint ammoKey,
+        Vector3 worldPos,
+        Vector3 forward,
+        byte surfaceMaterial,
+        byte fusedStatus,
+        byte category,
+        byte ricochetType,
+        byte flags,
+        byte impactAudioType,
+        bool simpleAudioFuzed,
+        bool logParticleFx,
+        bool logHealth)
+    {
+        _ = category;
+        _ = ricochetType;
+        if (!AcceptMission(token, phase) || !AcceptSeq(seq, CoopCombatPacket.EventParticleImpact, logHealth))
+            return;
+        _particleImpactRecvCount++;
+        ParticleEffectsManager? pem = ParticleEffectsManager.Instance;
+        if (pem == null)
+            return;
+        if (!CoopAmmoResolver.TryResolve(ammoKey, out AmmoType? ammo) || ammo == null)
+        {
+            MelonLogger.Warning($"[CoopNet] GHC ParticleImpact: ammoKey={ammoKey} not resolved");
+            return;
+        }
+
+        bool isRicochet = (flags & 1) != 0;
+        Vector3 fwd = forward.sqrMagnitude > 1e-8f ? forward.normalized : Vector3.forward;
+        try
+        {
+            GameObject? go = pem.CreateImpactEffectOfType(
+                ammo,
+                (ParticleEffectsManager.FusedStatus)fusedStatus,
+                (ParticleEffectsManager.SurfaceMaterial)surfaceMaterial,
+                isRicochet,
+                worldPos);
+            if (go != null)
+                go.transform.forward = fwd;
+        }
+        catch (Exception ex)
+        {
+            _particleImpactApplyFailCount++;
+            MelonLogger.Warning($"[CoopNet] GHC ParticleImpact apply failed: {ex.Message}");
+            return;
+        }
+
+        try
+        {
+            ImpactSFXManager.Instance?.PlaySimpleImpactAudio(
+                (ImpactAudioType)impactAudioType,
+                worldPos,
+                simpleAudioFuzed);
+        }
+        catch (Exception ex)
+        {
+            _particleImpactApplyFailCount++;
+            MelonLogger.Warning($"[CoopNet] GHC ParticleImpact audio failed: {ex.Message}");
+        }
+
+        if (logParticleFx)
+        {
+            MelonLogger.Msg($"[CoopNet] GHC recv ParticleImpact seq={seq} ammoKey={ammoKey} ric={isRicochet}");
+        }
+    }
+
+    private static void TryApplyGrenadeJetVisual(
+        uint seq,
+        uint token,
+        byte phase,
+        Vector3 worldPos,
+        Vector3 velocity,
+        bool useGravity,
+        byte maxLifeDs,
+        uint shooterNetId,
+        bool logJet,
+        bool logHealth)
+    {
+        if (!AcceptMission(token, phase) || !AcceptSeq(seq, CoopCombatPacket.EventGrenadeJetVisual, logHealth))
+            return;
+        CoopAtJetVisualReplay.TrySpawn(worldPos, velocity, useGravity, maxLifeDs, shooterNetId);
+        if (logJet)
+        {
+            MelonLogger.Msg(
+                $"[CoopNet] GHC recv GrenadeJetVisual seq={seq} shooter={shooterNetId} grav={useGravity} lifeDs={maxLifeDs}");
+        }
+    }
+
+    private static void TryApplyExplosion(
+        uint seq,
+        uint token,
+        byte phase,
+        Vector3 worldPos,
+        float tntKg,
+        byte explosionFlags,
+        bool logExplosion,
+        bool logHealth)
+    {
+        if (!AcceptMission(token, phase) || !AcceptSeq(seq, CoopCombatPacket.EventExplosion, logHealth))
+            return;
+        _explosionRecvCount++;
+        bool smokeGrenade = (explosionFlags & CoopCombatPacket.ExplosionFlagGrenadeSmoke) != 0;
+        if (smokeGrenade)
+        {
+            CoopGrenadeSmokeReplay.TrySpawn(worldPos);
+        }
+        else
+        {
+            try
+            {
+                Explosions.RegisterExplosion(worldPos, tntKg);
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning($"[CoopNet] GHC Explosion apply failed: {ex.Message}");
+                return;
+            }
+        }
+
+        float minTnt = CoopUdpTransport.ExplosionCameraMinTntKg;
+        UnityEngine.Camera? cam = UnityEngine.Camera.main;
+        float cameraTnt = smokeGrenade ? Mathf.Max(minTnt, 0.02f) : tntKg;
+        if (minTnt > 0f && cameraTnt >= minTnt && cam != null)
+        {
+            float d = Vector3.Distance(worldPos, cam.transform.position);
+            if (d <= CoopUdpTransport.ExplosionCameraMaxDistanceMeters)
+            {
+                GHPC.Camera.CameraJiggler.RequestExplosiveReaction(worldPos, cameraTnt);
+                GHPC.Camera.BlurManager.RequestExplosiveReaction(worldPos, cameraTnt);
+            }
+        }
+
+        if (logExplosion)
+        {
+            MelonLogger.Msg(
+                smokeGrenade
+                    ? $"[CoopNet] GHC recv Explosion seq={seq} smokeGrenade flags={explosionFlags}"
+                    : $"[CoopNet] GHC recv Explosion seq={seq} tnt={tntKg:F2}");
         }
     }
 
@@ -999,10 +1255,31 @@ internal static class ClientCombatApplier
         if (!AcceptMission(token, phase) || !AcceptSeq(seq, CoopCombatPacket.EventCompartmentState, logHealth))
             return;
         _compartmentStateRecvCount++;
+        bool hadPrev = LastCompartmentFirePresentByUnitNetId.TryGetValue(unitNetId, out bool prevFire);
+        bool prev = hadPrev && prevFire;
+        LastCompartmentFirePresentByUnitNetId[unitNetId] = state.FirePresent;
+        Unit? unit = CoopUnitLookup.TryFindByNetId(unitNetId);
+        if (unit != null)
+        {
+            bool localVehicle = PlayerInput.Instance != null
+                && PlayerInput.Instance.CurrentPlayerUnit == unit;
+            if (!localVehicle)
+                CoopCompartmentFxReplay.TryOpenExitsWhenCompartmentHasNoVentilation(unit, in state);
+            if (state.FirePresent && !prev)
+                CoopCompartmentFxReplay.TryFireBurstFx(unit, Mathf.Max(0.5f, state.CombinedFlameHeightPct / 25f));
+            CoopCompartmentFxReplay.TryApplySustainedFireAndSmoke(unit, in state);
+            FlammablesManager? fm = unit.GetComponent<FlammablesManager>();
+            if (fm != null && !localVehicle)
+            {
+                CoopCompartmentFxReplay.TryApplyScorchAndRemoteSmokeColumn(fm, state.ScorchPct, state.SmokeColumnPct);
+                CoopRemoteFlammablesBurningAudio.TrySync(fm, in state);
+            }
+        }
+
         if (logCompartmentState)
         {
             MelonLogger.Msg(
-                $"[CoopNet] GHC recv CompartmentState seq={seq} unit={unitNetId} fire={state.FirePresent} unsecured={state.UnsecuredFirePresent} flamePct={state.CombinedFlameHeightPct} tempPct={state.InternalTemperaturePct}");
+                $"[CoopNet] GHC recv CompartmentState seq={seq} unit={unitNetId} fire={state.FirePresent} unsecured={state.UnsecuredFirePresent} flamePct={state.CombinedFlameHeightPct} tempPct={state.InternalTemperaturePct} scorch={state.ScorchPct} smokeCol={state.SmokeColumnPct}");
         }
     }
 
@@ -1018,6 +1295,9 @@ internal static class ClientCombatApplier
             CoopCombatPacket.EventCrewState => "CrewState",
             CoopCombatPacket.EventHitResolved => "HitResolved",
             CoopCombatPacket.EventCompartmentState => "CompartmentState",
+            CoopCombatPacket.EventParticleImpact => "ParticleImpact",
+            CoopCombatPacket.EventExplosion => "Explosion",
+            CoopCombatPacket.EventGrenadeJetVisual => "GrenadeJetVisual",
             _ => "Unknown"
         };
     }
@@ -1039,6 +1319,9 @@ internal static class ClientCombatApplier
             && _crewStateApplyCount == 0
             && _hitResolvedRecvCount == 0
             && _compartmentStateRecvCount == 0
+            && _particleImpactRecvCount == 0
+            && _particleImpactApplyFailCount == 0
+            && _explosionRecvCount == 0
             && _damageStateCoalescedCount == 0
             && _struckCoalescedCount == 0
             && _damageStateDestroyParityMismatchCount == 0
@@ -1056,5 +1339,7 @@ internal static class ClientCombatApplier
             $"[CoopNet][Summary] GHC damage-state recv={_damageStateRecvCount} applied={_damageStateApplyCount} coalesced={_damageStateCoalescedCount} destroyParityMismatch={_damageStateDestroyParityMismatchCount} struckCoalesced={_struckCoalescedCount}");
         MelonLogger.Msg(
             $"[CoopNet][Summary] GHC unit-state recv={_unitStateRecvCount} applied={_unitStateApplyCount} crew-state recv={_crewStateRecvCount} applied={_crewStateApplyCount} hitResolved recv={_hitResolvedRecvCount} compartment-state recv={_compartmentStateRecvCount}");
+        MelonLogger.Msg(
+            $"[CoopNet][Summary] GHC cosmetic particleImpact recv={_particleImpactRecvCount} fail={_particleImpactApplyFailCount} explosion recv={_explosionRecvCount}");
     }
 }

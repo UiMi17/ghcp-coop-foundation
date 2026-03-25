@@ -45,6 +45,10 @@ internal static class CoopUdpTransport
 
     private static float _nextMissionMismatchLogTime = float.NegativeInfinity;
 
+    private static float _nextGhcNoPeerLogTime = float.NegativeInfinity;
+
+    private const float GhcNoPeerLogCooldownSeconds = 5f;
+
     private static bool _started;
 
     private static byte[]? _controlSendBuffer;
@@ -95,11 +99,35 @@ internal static class CoopUdpTransport
     /// <summary>When <see cref="_logCombatReplication" /> is true, log each DamageState send/recv.</summary>
     private static bool _logDamageState;
 
+    private static bool _particleImpactReplicationEnabled = true;
+
+    private static bool _explosionReplicationEnabled = true;
+
+    private static bool _muzzleCosmeticReplayEnabled = true;
+
+    private static float _cosmeticInterestMaxDistanceMeters;
+
+    private static float _explosionCameraMinTntKg = 0.01f;
+
+    private static float _explosionCameraMaxDistanceMeters = 400f;
+
+    private static bool _logCosmeticHealth;
+
+    private static bool _fragGrenadeCosmeticTntUseApRadius = true;
+
+    private static float _fragGrenadeCosmeticTntFallbackKg = 0.22f;
+
+    private static bool _atGrenadeJetVisualReplicationEnabled = true;
+
     private static uint _hostCombatSeq;
 
     public static bool IsNetworkActive => _started && _role != CoopNetRole.Off;
 
     public static bool IsHost => _started && _role == CoopNetRole.Host;
+
+    public static bool IsClient => _started && _role == CoopNetRole.Client;
+
+    public static bool CombatReplicationEnabledPublic => _combatReplicationEnabled;
 
     /// <summary>Host: GHC combat events to peer when network + combat replication are on.</summary>
     public static bool IsHostCombatReplicationActive =>
@@ -119,6 +147,30 @@ internal static class CoopUdpTransport
     /// <summary>Host: Phase 5 hit outcome event stream.</summary>
     public static bool IsHostHitResolvedReplicationActive =>
         IsHostCombatReplicationActive && _hitResolvedReplicationEnabled;
+
+    public static bool IsHostParticleImpactReplicationActive =>
+        IsHostCombatReplicationActive && _particleImpactReplicationEnabled;
+
+    public static bool IsHostExplosionReplicationActive =>
+        IsHostCombatReplicationActive && _explosionReplicationEnabled;
+
+    /// <summary>Host: emit GHC <see cref="CoopCombatPacket.EventGrenadeJetVisual" /> for AT grenade <see cref="GHPC.Weapons.LiveRound" /> spawns.</summary>
+    public static bool IsHostAtGrenadeJetVisualActive =>
+        IsHostCombatReplicationActive && _atGrenadeJetVisualReplicationEnabled;
+
+    internal static bool MuzzleCosmeticReplayEnabled => _muzzleCosmeticReplayEnabled;
+
+    internal static float CosmeticInterestMaxDistanceMeters => _cosmeticInterestMaxDistanceMeters;
+
+    internal static float ExplosionCameraMinTntKg => _explosionCameraMinTntKg;
+
+    internal static float ExplosionCameraMaxDistanceMeters => _explosionCameraMaxDistanceMeters;
+
+    internal static bool LogCosmeticHealth => _logCombatReplication && _logCosmeticHealth;
+
+    internal static bool FragGrenadeCosmeticTntUseApRadius => _fragGrenadeCosmeticTntUseApRadius;
+
+    internal static float FragGrenadeCosmeticTntFallbackKg => _fragGrenadeCosmeticTntFallbackKg;
 
     internal static int HitResolvedMaxPerSecond => _hitResolvedMaxPerSecond;
 
@@ -158,6 +210,32 @@ internal static class CoopUdpTransport
         _logDamageState = logDamageState;
     }
 
+    public static void SetCosmeticReplicationPrefs(
+        bool suppressRemoteShooterRoundCosmetics,
+        bool particleImpactEnabled,
+        bool explosionEnabled,
+        bool muzzleReplayEnabled,
+        float cosmeticInterestMaxDistanceMeters,
+        float explosionCameraMinTntKg,
+        float explosionCameraMaxDistanceMeters,
+        bool logCosmeticHealth,
+        bool fragGrenadeCosmeticTntUseApRadius,
+        float fragGrenadeCosmeticTntFallbackKg,
+        bool atGrenadeJetVisualReplicationEnabled)
+    {
+        CoopClientFxSuppression.SuppressRemoteShooterCosmeticsEnabled = suppressRemoteShooterRoundCosmetics;
+        _particleImpactReplicationEnabled = particleImpactEnabled;
+        _explosionReplicationEnabled = explosionEnabled;
+        _muzzleCosmeticReplayEnabled = muzzleReplayEnabled;
+        _cosmeticInterestMaxDistanceMeters = cosmeticInterestMaxDistanceMeters < 0f ? 0f : cosmeticInterestMaxDistanceMeters;
+        _explosionCameraMinTntKg = explosionCameraMinTntKg < 0f ? 0f : explosionCameraMinTntKg;
+        _explosionCameraMaxDistanceMeters = explosionCameraMaxDistanceMeters <= 0f ? 400f : explosionCameraMaxDistanceMeters;
+        _logCosmeticHealth = logCosmeticHealth;
+        _fragGrenadeCosmeticTntUseApRadius = fragGrenadeCosmeticTntUseApRadius;
+        _fragGrenadeCosmeticTntFallbackKg = fragGrenadeCosmeticTntFallbackKg < 0f ? 0.22f : fragGrenadeCosmeticTntFallbackKg;
+        _atGrenadeJetVisualReplicationEnabled = atGrenadeJetVisualReplicationEnabled;
+    }
+
     internal static bool CombatReplicationLogFired => _logCombatReplication;
 
     internal static bool CombatReplicationLogStruckPerHit => _logCombatReplication && _logCombatStruckPerHit;
@@ -180,8 +258,22 @@ internal static class CoopUdpTransport
 
     public static bool TryHostSendCombat(byte[] buffer, int length)
     {
-        if (!IsHost || _udp == null || _hostPeer == null || buffer == null || length <= 0)
+        if (!IsHost || _udp == null || buffer == null || length <= 0)
             return false;
+        if (_hostPeer == null)
+        {
+            if (_combatReplicationEnabled && Time.time >= _nextGhcNoPeerLogTime)
+            {
+                _nextGhcNoPeerLogTime = Time.time + GhcNoPeerLogCooldownSeconds;
+                MelonLogger.Warning(
+                    "[CoopNet] GHC send skipped: host has no UDP peer yet (no client endpoint). " +
+                    "Combat/cosmetic packets are dropped until the client sends Hello/GHP/Heartbeat — " +
+                    "states on the client will diverge for events that happen in this window.");
+            }
+
+            return false;
+        }
+
         try
         {
             _udp.Send(buffer, length, _hostPeer);
@@ -649,6 +741,7 @@ internal static class CoopUdpTransport
     private static void ResetCombatSessionState()
     {
         _hostCombatSeq = 0;
+        CoopCosmeticHealthCounters.ResetSession();
         HostCombatBroadcast.ResetSession();
         ClientCombatApplier.ResetSession();
         CoopAmmoResolver.InvalidateCache();
