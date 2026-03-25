@@ -117,6 +117,8 @@ internal static class ClientWorldProxyService
 
     private static void ApplyMergedSnapshot(List<WorldEntityWire> entities, bool logReceive, uint hostSeq)
     {
+        ClientSimulationGovernor.OnMergedWorldSnapshot(entities);
+
         uint skipNetId = 0;
         if (CoopRemoteState.HasData && CoopRemoteState.RemoteUnitNetId != 0)
             skipNetId = CoopRemoteState.RemoteUnitNetId;

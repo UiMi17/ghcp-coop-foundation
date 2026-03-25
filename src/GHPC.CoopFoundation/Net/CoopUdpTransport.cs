@@ -136,7 +136,7 @@ internal static class CoopUdpTransport
 
     internal static bool CombatReplicationLogImpactFx => _logCombatReplication && _logImpactFx;
 
-    internal static bool CombatReplicationLogDamageState => _logCombatReplication && _logDamageState;
+    internal static bool CombatReplicationLogDamageState => _logDamageState;
 
     internal static bool CombatReplicationLogHealth => _logCombatReplication;
 
@@ -260,6 +260,7 @@ internal static class CoopUdpTransport
         HostWorldReplication.Reset();
         CoopUnitWireRegistry.ResetSession();
         ClientWorldProxyService.ClearAll();
+        ClientSimulationGovernor.ResetSession();
         ResetCombatSessionState();
     }
 

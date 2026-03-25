@@ -119,6 +119,30 @@ public sealed class CoopFoundationMod : MelonMod
     private static readonly MelonPreferences_Entry<bool> LogDamageState =
         PrefCategory.CreateEntry("LogDamageState", false);
 
+    /// <summary>Phase 5: correction-first governor for non-local client units.</summary>
+    private static readonly MelonPreferences_Entry<bool> ClientSimulationSuppressionEnabled =
+        PrefCategory.CreateEntry("ClientSimulationSuppressionEnabled", true);
+
+    /// <summary>Phase 5 correction strength multiplier (0 = off, 1 = default).</summary>
+    private static readonly MelonPreferences_Entry<float> ClientSimulationCorrectionStrength =
+        PrefCategory.CreateEntry("ClientSimulationCorrectionStrength", 1f);
+
+    /// <summary>Phase 5 M3: soft suppress non-local crew AI where API is safe.</summary>
+    private static readonly MelonPreferences_Entry<bool> ClientSimulationSoftSuppressEnabled =
+        PrefCategory.CreateEntry("ClientSimulationSoftSuppressEnabled", true);
+
+    /// <summary>Throttled phase 5 diagnostics.</summary>
+    private static readonly MelonPreferences_Entry<bool> ClientSimulationLog =
+        PrefCategory.CreateEntry("ClientSimulationLog", false);
+
+    /// <summary>If true, disable phase 5 correction on first runtime exception.</summary>
+    private static readonly MelonPreferences_Entry<bool> ClientSimulationSafeMode =
+        PrefCategory.CreateEntry("ClientSimulationSafeMode", true);
+
+    /// <summary>Trace post-apply turret/gun overwrites by LateFollow/constraints (diagnostics).</summary>
+    private static readonly MelonPreferences_Entry<bool> ClientSimulationAimTrace =
+        PrefCategory.CreateEntry("ClientSimulationAimTrace", false);
+
     public override void OnInitializeMelon()
     {
         HookDiagnostics.Init(LogGameHooks);
@@ -130,7 +154,7 @@ public sealed class CoopFoundationMod : MelonMod
         LoggerInstance.Msg(
             $"GHPC Coop Foundation {CoopModMetadata.Version} — Harmony patches applied ({HarmonyId}).");
         LoggerInstance.Msg(
-            "Network: UDP GHP v3 + GHW world + GHC combat (+ ImpactFx + DamageState correction v0.6.1); COO session; vehicle ownership; remote ghost + world proxies.");
+            "Network: UDP GHP v3 + GHW world + GHC combat (+ ImpactFx + DamageState correction); COO session; vehicle ownership; remote ghost + world proxies; phase5 correction governor.");
 
         CoopUdpTransport.ConfigureAndStart(
             NetworkEnabled.Value,
@@ -159,8 +183,16 @@ public sealed class CoopFoundationMod : MelonMod
             CombatApplyMaxMsPerFrame.Value);
         CoopUdpTransport.SetImpactFxReplicationPrefs(ImpactFxReplicationEnabled.Value, LogImpactFx.Value);
         CoopUdpTransport.SetDamageStateReplicationPrefs(DamageStateReplicationEnabled.Value, LogDamageState.Value);
+        ClientSimulationGovernor.Configure(
+            ClientSimulationSuppressionEnabled.Value,
+            ClientSimulationCorrectionStrength.Value,
+            ClientSimulationSoftSuppressEnabled.Value,
+            ClientSimulationLog.Value,
+            ClientSimulationSafeMode.Value);
+        AimOverwriteProbe.Configure(ClientSimulationAimTrace.Value);
         CoopUdpTransport.ProcessInbound();
         CoopUdpTransport.DrainClientCombatApply();
+        ClientSimulationGovernor.TickUpdate(Time.deltaTime);
         CoopUdpTransport.NetworkSessionTick();
         CoopUdpTransport.HostTickWorldReplication(Time.deltaTime);
         LocalPlayerSampler.Tick(
@@ -172,6 +204,7 @@ public sealed class CoopFoundationMod : MelonMod
 
     public override void OnLateUpdate()
     {
+        ClientSimulationGovernor.TickLateUpdate(Time.deltaTime);
         RemoteGhostService.TickLateUpdate(ShowRemoteGhost.Value, RemoteGhostSmoothing.Value, RemoteGhostYOffset.Value);
         ClientWorldProxyService.TickLateUpdate(
             ShowWorldProxies.Value,

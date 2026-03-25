@@ -14,6 +14,7 @@ internal static class HostCombatBroadcast
     private static readonly Dictionary<uint, float> NextDamageStateSendTimeByNetId = new();
 
     private const float DamageStateMinIntervalSeconds = 0.1f;
+    private const int DestroyedStateRedundantSends = 3;
 
     public static bool CanEmit =>
         CoopUdpTransport.IsHostCombatReplicationActive;
@@ -139,25 +140,39 @@ internal static class HostCombatBroadcast
             return;
 
         EnsureBuffer();
-        uint seq = CoopUdpTransport.TakeNextHostCombatSeq();
         uint token = CoopSessionState.MissionCoherenceToken;
         byte phase = CoopSessionState.MissionStateToWirePhase();
-        int len = CoopCombatPacket.WriteDamageState(
-            _buffer!,
-            seq,
-            token,
-            phase,
-            victimNetId,
-            snap);
-        if (CoopUdpTransport.TryHostSendCombat(_buffer!, len))
+        int sends = snap.UnitDestroyed ? DestroyedStateRedundantSends : 1;
+        bool anySent = false;
+        uint firstSeq = 0;
+        uint lastSeq = 0;
+        for (int i = 0; i < sends; i++)
         {
-            LastDamageStateByNetId[victimNetId] = snap;
-            NextDamageStateSendTimeByNetId[victimNetId] = now + DamageStateMinIntervalSeconds;
-            if (logDamageState)
+            uint seq = CoopUdpTransport.TakeNextHostCombatSeq();
+            if (i == 0)
+                firstSeq = seq;
+            lastSeq = seq;
+            int len = CoopCombatPacket.WriteDamageState(
+                _buffer!,
+                seq,
+                token,
+                phase,
+                victimNetId,
+                snap);
+            if (CoopUdpTransport.TryHostSendCombat(_buffer!, len))
             {
-                MelonLogger.Msg(
-                    $"[CoopNet] GHC send DamageState seq={seq} victim={victimNetId} destroyed={snap.UnitDestroyed} e/t/r/l/r={snap.EngineHpPct}/{snap.TransmissionHpPct}/{snap.RadiatorHpPct}/{snap.LeftTrackHpPct}/{snap.RightTrackHpPct}");
+                anySent = true;
             }
+        }
+
+        if (!anySent)
+            return;
+        LastDamageStateByNetId[victimNetId] = snap;
+        NextDamageStateSendTimeByNetId[victimNetId] = now + DamageStateMinIntervalSeconds;
+        if (logDamageState)
+        {
+            MelonLogger.Msg(
+                $"[CoopNet] GHC send DamageState seq={firstSeq}{(lastSeq != firstSeq ? $"..{lastSeq}" : string.Empty)} victim={victimNetId} destroyed={snap.UnitDestroyed} sends={sends} e/t/r/l/r={snap.EngineHpPct}/{snap.TransmissionHpPct}/{snap.RadiatorHpPct}/{snap.LeftTrackHpPct}/{snap.RightTrackHpPct}");
         }
     }
 

@@ -86,6 +86,23 @@ internal static class CoopVehicleOwnership
         return owner == LocalPeerId;
     }
 
+    /// <summary>Client mirror lookup: 0 means unknown/unowned.</summary>
+    public static byte GetOwnerPeer(uint unitNetId)
+    {
+        if (unitNetId == 0)
+            return 0;
+        return Mirror.TryGetValue(unitNetId, out byte owner) ? owner : (byte)0;
+    }
+
+    /// <summary>True when mirror says this unit is owned by local peer.</summary>
+    public static bool IsLocalOwner(uint unitNetId)
+    {
+        if (unitNetId == 0)
+            return false;
+        byte owner = GetOwnerPeer(unitNetId);
+        return owner != 0 && owner == LocalPeerId;
+    }
+
     public static void LogEnterBlocked(uint netId, Unit unit)
     {
         if (!_logBlocks)
