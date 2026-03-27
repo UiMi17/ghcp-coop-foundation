@@ -280,7 +280,8 @@ internal static class HostCombatBroadcast
         bool changed = !hasLast || !snap.NearlyEquals(last);
         if (!changed)
             return;
-        if (!force && hasNext && now < nextTime)
+        bool destroyedEdge = snap.UnitDestroyed && (!hasLast || !last.UnitDestroyed);
+        if (hasNext && now < nextTime && !destroyedEdge)
             return;
 
         EnsureBuffer();
@@ -335,7 +336,7 @@ internal static class HostCombatBroadcast
         bool changed = !hasLast || !snap.NearlyEquals(last);
         if (!changed)
             return;
-        if (!force && hasNext && now < nextTime)
+        if (hasNext && now < nextTime)
             return;
 
         EnsureBuffer();
@@ -370,7 +371,7 @@ internal static class HostCombatBroadcast
         bool changed = !hasLast || !snap.NearlyEquals(last);
         if (!changed)
             return;
-        if (!force && hasNext && now < nextTime)
+        if (hasNext && now < nextTime)
             return;
 
         EnsureBuffer();
@@ -498,7 +499,8 @@ internal static class HostCombatBroadcast
         bool changed = !hasLast || !snap.NearlyEquals(last);
         if (!changed && !force)
             return;
-        if (!force && hasNext && now < nextTime)
+        bool fireStarted = snap.FirePresent && (!hasLast || !last.FirePresent);
+        if (hasNext && now < nextTime && !fireStarted)
             return;
 
         EnsureBuffer();

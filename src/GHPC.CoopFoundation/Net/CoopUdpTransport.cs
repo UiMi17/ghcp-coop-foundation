@@ -25,6 +25,8 @@ internal static class CoopUdpTransport
     private static readonly object InboxLock = new();
 
     private static readonly Queue<(IPEndPoint Remote, byte[] Data)> Inbox = new();
+    // Balanced profile: cap per-frame network burst without over-throttling steady sync.
+    private const int MaxInboundDatagramsPerTick = 192;
 
     private static UdpClient? _udp;
 
@@ -61,6 +63,11 @@ internal static class CoopUdpTransport
     private static bool _logWorldReplicationSend;
 
     private static bool _logWorldReplicationReceive;
+    private static float _nextWorldBurstLogTime = float.NegativeInfinity;
+    private static int _worldDatagramsThisTick;
+    private static int _worldDatagramsMaxTick;
+    private static uint _worldDatagramsTotal;
+    private static uint _worldProcessTicks;
 
     private static bool _combatReplicationEnabled = true;
 
@@ -119,6 +126,15 @@ internal static class CoopUdpTransport
 
     private static bool _atGrenadeJetVisualReplicationEnabled = true;
 
+    /// <summary>Host→client COO <see cref="CoopControlPacket.OpWorldEnv" /> (mission atmosphere / ballistics globals).</summary>
+    private static bool _worldEnvironmentReplicationEnabled = true;
+
+    private static float _worldEnvironmentReplicationHz = 1f;
+
+    private static float _hostWorldEnvSendAccumulator;
+
+    private static bool _logWorldEnvironmentSync;
+
     private static uint _hostCombatSeq;
 
     public static bool IsNetworkActive => _started && _role != CoopNetRole.Off;
@@ -128,6 +144,9 @@ internal static class CoopUdpTransport
     public static bool IsClient => _started && _role == CoopNetRole.Client;
 
     public static bool CombatReplicationEnabledPublic => _combatReplicationEnabled;
+
+    /// <summary>User prefs: replicate WorldEnvironmentManager + Weather (COO WorldEnv).</summary>
+    public static bool WorldEnvironmentReplicationEnabledPublic => _worldEnvironmentReplicationEnabled;
 
     /// <summary>Host: GHC combat events to peer when network + combat replication are on.</summary>
     public static bool IsHostCombatReplicationActive =>
@@ -196,6 +215,13 @@ internal static class CoopUdpTransport
         _hitResolvedMaxPerSecond = hitResolvedMaxPerSecond < 0 ? 0 : hitResolvedMaxPerSecond;
         _hitResolvedHostMaxPerFrame = hitResolvedHostMaxPerFrame < 0 ? 0 : hitResolvedHostMaxPerFrame;
         _hitResolvedApplyMaxPerFrame = hitResolvedApplyMaxPerFrame < 0 ? 0 : hitResolvedApplyMaxPerFrame;
+    }
+
+    public static void SetWorldEnvironmentReplicationPrefs(bool enabled, float hz, bool logSync)
+    {
+        _worldEnvironmentReplicationEnabled = enabled;
+        _worldEnvironmentReplicationHz = hz <= 0f ? 0f : hz;
+        _logWorldEnvironmentSync = logSync;
     }
 
     public static void SetImpactFxReplicationPrefs(bool enabled, bool logImpactFx)
@@ -381,6 +407,8 @@ internal static class CoopUdpTransport
         CoopUnitWireRegistry.ResetSession();
         ClientWorldProxyService.ClearAll();
         ClientSimulationGovernor.ResetSession();
+        CoopWorldEnvironmentReplication.ClearSession();
+        _hostWorldEnvSendAccumulator = 0f;
         ResetCombatSessionState();
     }
 
@@ -396,8 +424,12 @@ internal static class CoopUdpTransport
         if (!_started || _udp == null)
             return;
 
+        int processed = 0;
+        _worldDatagramsThisTick = 0;
         while (true)
         {
+            if (processed >= MaxInboundDatagramsPerTick)
+                break;
             (IPEndPoint Remote, byte[] Data) item;
             lock (InboxLock)
             {
@@ -405,6 +437,7 @@ internal static class CoopUdpTransport
                     break;
                 item = Inbox.Dequeue();
             }
+            processed++;
 
             byte[] data = item.Data;
             if (CoopControlPacket.IsCoopControl(data, data.Length))
@@ -425,6 +458,7 @@ internal static class CoopUdpTransport
                 if (_role == CoopNetRole.Client
                     && CoopWorldPacket.TryRead(data, data.Length, out CoopWorldPacketDecoded world))
                 {
+                    _worldDatagramsThisTick++;
                     ClientWorldProxyService.OnWorldDecoded(in world, _logWorldReplicationReceive);
                 }
 
@@ -463,6 +497,20 @@ internal static class CoopUdpTransport
                 MelonLogger.Msg(
                     $"[CoopNet] recv seq={snap.Sequence} id={snap.InstanceId} netId={snap.UnitNetId} from={item.Remote} " +
                     $"pos=({snap.Position.x:F1},{snap.Position.y:F1},{snap.Position.z:F1}) hullEuler=({e.x:F0},{e.y:F0},{e.z:F0}){extra}");
+            }
+        }
+        if (_role == CoopNetRole.Client && _worldDatagramsThisTick > 0)
+        {
+            _worldProcessTicks++;
+            _worldDatagramsTotal += (uint)_worldDatagramsThisTick;
+            if (_worldDatagramsThisTick > _worldDatagramsMaxTick)
+                _worldDatagramsMaxTick = _worldDatagramsThisTick;
+            if (_logWorldReplicationReceive && Time.time >= _nextWorldBurstLogTime)
+            {
+                float avgPerTick = _worldProcessTicks > 0 ? (float)_worldDatagramsTotal / _worldProcessTicks : 0f;
+                MelonLogger.Msg(
+                    $"[CoopNet] GHW burst stats tick={_worldDatagramsThisTick} avg={avgPerTick:0.00} max={_worldDatagramsMaxTick}");
+                _nextWorldBurstLogTime = Time.time + 2f;
             }
         }
     }
@@ -550,23 +598,40 @@ internal static class CoopUdpTransport
         HostWorldReplication.Reset();
         CoopUnitWireRegistry.ResetSession();
         ClientWorldProxyService.ClearAll();
+        CoopWorldEnvironmentReplication.ClearSession();
+        _hostWorldEnvSendAccumulator = 0f;
         ResetCombatSessionState();
     }
 
-    /// <summary>Host: periodic GHW broadcast to connected peer (main thread).</summary>
+    /// <summary>Host: periodic GHW + low-rate COO WorldEnv refresh to keep weather/sky authoritative on clients.</summary>
     public static void HostTickWorldReplication(float deltaTime)
     {
-        if (!_started || _udp == null || _role != CoopNetRole.Host || !_worldReplicationEnabled)
+        if (!_started || _udp == null || _role != CoopNetRole.Host)
             return;
         if (_hostPeer == null)
             return;
-        float interval = 1f / _worldReplicationHz;
-        HostWorldReplication.TickSend(
-            deltaTime,
-            interval,
-            _logWorldReplicationSend,
-            _udp,
-            _hostPeer);
+
+        if (_worldReplicationEnabled)
+        {
+            float interval = 1f / _worldReplicationHz;
+            HostWorldReplication.TickSend(
+                deltaTime,
+                interval,
+                _logWorldReplicationSend,
+                _udp,
+                _hostPeer);
+        }
+
+        if (!_worldEnvironmentReplicationEnabled || _worldEnvironmentReplicationHz <= 0f)
+            return;
+
+        _hostWorldEnvSendAccumulator += Mathf.Max(0f, deltaTime);
+        float worldEnvInterval = 1f / _worldEnvironmentReplicationHz;
+        if (_hostWorldEnvSendAccumulator < worldEnvInterval)
+            return;
+
+        _hostWorldEnvSendAccumulator = 0f;
+        TrySendWorldEnvironmentToPeer(_hostPeer);
     }
 
     public static void SendSwitchPacket(byte peerId, uint oldNetId, uint newNetId)
@@ -666,11 +731,76 @@ internal static class CoopUdpTransport
         {
             CoopControlPacket.WriteWelcome(_controlSendBuffer, assignedPeerId, nonceEcho);
             _udp.Send(_controlSendBuffer, CoopControlPacket.FixedControlPayloadLength, clientRemote);
+            TrySendWorldEnvironmentToPeer(clientRemote);
         }
         catch (Exception ex)
         {
             MelonLogger.Warning($"[CoopNet] SendWelcome failed: {ex.Message}");
         }
+    }
+
+    /// <summary>Host: push current <see cref="GHPC.World.WorldEnvironmentManager" /> snapshot (COO, not GHC).</summary>
+    internal static void TrySendWorldEnvironmentToPeer(IPEndPoint peerRemote)
+    {
+        if (!IsHost || !_worldEnvironmentReplicationEnabled || _udp == null || _controlSendBuffer == null || peerRemote == null)
+            return;
+        try
+        {
+            if (!CoopWorldEnvironmentReplication.TryCaptureHost(
+                    out float tc,
+                    out float ad,
+                    out float af,
+                    out float ac,
+                    out bool night,
+                    out bool wv,
+                    out bool wDyn,
+                    out float wr,
+                    out float wc,
+                    out float ww,
+                    out float wcb,
+                    out byte wCloudCond,
+                    out float wCloudSpeed,
+                    out float wCloudDirX,
+                    out float wCloudDirY))
+                return;
+            int len = CoopControlPacket.WriteWorldEnvV4(
+                _controlSendBuffer,
+                tc,
+                ad,
+                af,
+                ac,
+                night,
+                wv,
+                wDyn,
+                wr,
+                wc,
+                ww,
+                wcb,
+                wCloudCond,
+                wCloudSpeed,
+                wCloudDirX,
+                wCloudDirY);
+            _udp.Send(_controlSendBuffer, len, peerRemote);
+            if (_logWorldEnvironmentSync)
+            {
+                MelonLogger.Msg(
+                    wv
+                        ? $"[CoopNet] COO send WorldEnv v4 to={peerRemote} T={tc:F1}°C night={night} rain={wr:F2} cloud={wc:F2} wind={ww:F2} cloudIdx={wCloudCond} dyn={wDyn}"
+                        : $"[CoopNet] COO send WorldEnv v4 to={peerRemote} T={tc:F1}°C night={night} (no Weather)");
+            }
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[CoopNet] WorldEnv send failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>Host: resend world env to connected peer (e.g. mission entered <c>Playing</c>).</summary>
+    public static void HostBroadcastWorldEnvironmentToPeer()
+    {
+        if (_hostPeer == null)
+            return;
+        TrySendWorldEnvironmentToPeer(_hostPeer);
     }
 
     private static void ProcessControlPacket(IPEndPoint remote, byte[] data, int length)
@@ -688,6 +818,54 @@ internal static class CoopUdpTransport
             SendWelcome(remote, assigned, nonce);
             if (CoopSessionState.IsPlaying)
                 SendOwnerSync();
+            return;
+        }
+
+        if (op == CoopControlPacket.OpWorldEnv && _role == CoopNetRole.Client)
+        {
+            if (_worldEnvironmentReplicationEnabled
+                && CoopControlPacket.TryParseWorldEnv(
+                    data,
+                    length,
+                    out float tc,
+                    out float ad,
+                    out float af,
+                    out float ac,
+                    out bool night,
+                    out bool wv,
+                    out bool wDyn,
+                    out float wr,
+                    out float wc,
+                    out float ww,
+                    out float wcb,
+                    out bool cloudLayerOk,
+                    out byte wCloudCond,
+                    out float wCloudSpeed,
+                    out bool cloudDirOk,
+                    out float wCloudDirX,
+                    out float wCloudDirY))
+            {
+                CoopWorldEnvironmentReplication.ApplyFromHost(
+                    tc,
+                    ad,
+                    af,
+                    ac,
+                    night,
+                    wv,
+                    wDyn,
+                    wr,
+                    wc,
+                    ww,
+                    wcb,
+                    cloudLayerOk,
+                    wCloudCond,
+                    wCloudSpeed,
+                    cloudDirOk,
+                    wCloudDirX,
+                    wCloudDirY,
+                    _logWorldEnvironmentSync);
+            }
+
             return;
         }
 
@@ -741,6 +919,11 @@ internal static class CoopUdpTransport
     private static void ResetCombatSessionState()
     {
         _hostCombatSeq = 0;
+        _nextWorldBurstLogTime = float.NegativeInfinity;
+        _worldDatagramsThisTick = 0;
+        _worldDatagramsMaxTick = 0;
+        _worldDatagramsTotal = 0;
+        _worldProcessTicks = 0;
         CoopCosmeticHealthCounters.ResetSession();
         HostCombatBroadcast.ResetSession();
         ClientCombatApplier.ResetSession();

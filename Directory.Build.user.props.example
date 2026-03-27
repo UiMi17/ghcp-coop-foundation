@@ -1,8 +1,8 @@
 <Project>
   <PropertyGroup>
     <!-- Copy to Directory.Build.user.props and adjust if your Steam library path differs. -->
-    <GHPCGameDir>D:\Games\Steam\steamapps\common\Gunner HEAT PC\Bin</GHPCGameDir>
+    <GHPCGameDir>E:\SteamLibrary\steamapps\common\Gunner HEAT PC\Bin</GHPCGameDir>
     <!-- Optional: second install (loopback Client copy). Leave empty to skip: <GHPCGameDirSecondary></GHPCGameDirSecondary> -->
-    <GHPCGameDirSecondary>D:\Games\Steam\steamapps\common\Gunner HEAT PC - Copy\Bin</GHPCGameDirSecondary>
+    <GHPCGameDirSecondary>E:\SteamLibrary\steamapps\common\Gunner HEAT PC - Copy\Bin</GHPCGameDirSecondary>
   </PropertyGroup>
 </Project>

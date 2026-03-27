@@ -41,13 +41,17 @@ internal static class ClientCombatApplier
     private static uint _struckCoalescedCount;
     private static uint _damageStateDestroyParityMismatchCount;
     private static uint _budgetHitCount;
+    private static uint _cosmeticDropQueuePressureCount;
     private static float _nextSeqGapLogTime = float.NegativeInfinity;
     private static int _maxPendingDepth;
     private static float _nextQueuePressureLogTime = float.NegativeInfinity;
     private static float _nextBudgetHitLogTime = float.NegativeInfinity;
+    private static float _nextCosmeticDropLogTime = float.NegativeInfinity;
 
     private const int QueuePressureWarnThreshold = 128;
     private const int QueuePressureCriticalThreshold = 256;
+    // Balanced profile: start shedding cosmetic-only events only under clear queue stress.
+    private const int QueuePressureLowPriorityDropThreshold = 224;
     private const float HealthLogCooldownSeconds = 2f;
 
     private struct PendingCombatPacket
@@ -91,10 +95,12 @@ internal static class ClientCombatApplier
         _struckCoalescedCount = 0;
         _damageStateDestroyParityMismatchCount = 0;
         _budgetHitCount = 0;
+        _cosmeticDropQueuePressureCount = 0;
         _maxPendingDepth = 0;
         _nextSeqGapLogTime = float.NegativeInfinity;
         _nextQueuePressureLogTime = float.NegativeInfinity;
         _nextBudgetHitLogTime = float.NegativeInfinity;
+        _nextCosmeticDropLogTime = float.NegativeInfinity;
         PendingHigh.Clear();
         PendingLow.Clear();
         CoalescedSeq.Clear();
@@ -117,8 +123,26 @@ internal static class ClientCombatApplier
             return;
         if (!CoopCombatPacket.IsCoopCombat(data, length))
             return;
-        if (CoopCombatPacket.TryRead(data, length, out byte eventType, out uint eventSeq, out _, out _)
-            && eventType == CoopCombatPacket.EventHitResolved)
+
+        if (!CoopCombatPacket.TryRead(data, length, out byte eventType, out uint eventSeq, out _, out _))
+            return;
+
+        bool lowPriority = IsLowPriorityEvent(eventType);
+        if (lowPriority && PendingCombatCount >= QueuePressureLowPriorityDropThreshold)
+        {
+            CoalescedSeq.Add(eventSeq);
+            _cosmeticDropQueuePressureCount++;
+            if (Time.time >= _nextCosmeticDropLogTime)
+            {
+                MelonLogger.Warning(
+                    $"[CoopNet][Health] dropping low-priority GHC due to queue pressure: event={EventTypeName(eventType)} seq={eventSeq} pending={PendingCombatCount} threshold={QueuePressureLowPriorityDropThreshold}");
+                _nextCosmeticDropLogTime = Time.time + HealthLogCooldownSeconds;
+            }
+
+            return;
+        }
+
+        if (eventType == CoopCombatPacket.EventHitResolved)
         {
             // HitResolved is low-priority telemetry; mark seq as locally handled to avoid false network-gap noise.
             CoalescedSeq.Add(eventSeq);
@@ -136,9 +160,21 @@ internal static class ClientCombatApplier
             return;
         if (TryCoalesceDamageState(ref data, length))
             return;
-        PendingHigh.Enqueue(new PendingCombatPacket { Data = data, Length = length });
+        if (lowPriority)
+            PendingLow.Enqueue(new PendingCombatPacket { Data = data, Length = length });
+        else
+            PendingHigh.Enqueue(new PendingCombatPacket { Data = data, Length = length });
         if (PendingCombatCount > _maxPendingDepth)
             _maxPendingDepth = PendingCombatCount;
+    }
+
+    private static bool IsLowPriorityEvent(byte eventType)
+    {
+        return eventType == CoopCombatPacket.EventHitResolved
+               || eventType == CoopCombatPacket.EventImpactFx
+               || eventType == CoopCombatPacket.EventParticleImpact
+               || eventType == CoopCombatPacket.EventExplosion
+               || eventType == CoopCombatPacket.EventGrenadeJetVisual;
     }
 
     private static bool TryCoalesceStruck(ref byte[] data, int length)
@@ -1326,6 +1362,7 @@ internal static class ClientCombatApplier
             && _struckCoalescedCount == 0
             && _damageStateDestroyParityMismatchCount == 0
             && _budgetHitCount == 0
+            && _cosmeticDropQueuePressureCount == 0
             && pending == 0)
         {
             return;
@@ -1341,5 +1378,7 @@ internal static class ClientCombatApplier
             $"[CoopNet][Summary] GHC unit-state recv={_unitStateRecvCount} applied={_unitStateApplyCount} crew-state recv={_crewStateRecvCount} applied={_crewStateApplyCount} hitResolved recv={_hitResolvedRecvCount} compartment-state recv={_compartmentStateRecvCount}");
         MelonLogger.Msg(
             $"[CoopNet][Summary] GHC cosmetic particleImpact recv={_particleImpactRecvCount} fail={_particleImpactApplyFailCount} explosion recv={_explosionRecvCount}");
+        MelonLogger.Msg(
+            $"[CoopNet][Summary] GHC queue budgetHits={_budgetHitCount} cosmeticDropsByPressure={_cosmeticDropQueuePressureCount}");
     }
 }

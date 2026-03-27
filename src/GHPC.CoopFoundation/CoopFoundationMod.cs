@@ -77,6 +77,17 @@ public sealed class CoopFoundationMod : MelonMod
     private static readonly MelonPreferences_Entry<bool> LogWorldReplication =
         PrefCategory.CreateEntry("LogWorldReplication", false);
 
+    /// <summary>Host→client COO snapshot of <see cref="GHPC.World.WorldEnvironmentManager" /> (temperature, night, etc.).</summary>
+    private static readonly MelonPreferences_Entry<bool> WorldEnvironmentReplicationEnabled =
+        PrefCategory.CreateEntry("WorldEnvironmentReplicationEnabled", true);
+
+    private static readonly MelonPreferences_Entry<bool> LogWorldEnvironmentSync =
+        PrefCategory.CreateEntry("LogWorldEnvironmentSync", false);
+
+    /// <summary>Host periodic COO refresh for world atmosphere/weather (Hz, 0 disables periodic refresh).</summary>
+    private static readonly MelonPreferences_Entry<float> WorldEnvironmentReplicationHz =
+        PrefCategory.CreateEntry("WorldEnvironmentReplicationHz", 1f);
+
     private static readonly MelonPreferences_Entry<bool> ShowWorldProxies =
         PrefCategory.CreateEntry("ShowWorldProxies", true);
 
@@ -214,7 +225,7 @@ public sealed class CoopFoundationMod : MelonMod
         LoggerInstance.Msg(
             $"GHPC Coop Foundation {CoopModMetadata.Version} — Harmony patches applied ({HarmonyId}).");
         LoggerInstance.Msg(
-            "Network: UDP GHP v3 + GHW world + GHC combat (+ ImpactFx + ParticleImpact + Explosion + muzzle replay + DamageState); COO; phase5 governor; phase6 cosmetic channel.");
+            "Network: UDP GHP v3 + GHW world + GHC combat (+ ImpactFx + ParticleImpact + Explosion + muzzle replay + DamageState); COO (+ WorldEnv); phase5 governor; phase6 cosmetic channel.");
 
         CoopUdpTransport.ConfigureAndStart(
             NetworkEnabled.Value,
@@ -236,6 +247,10 @@ public sealed class CoopFoundationMod : MelonMod
             WorldReplicationHz.Value,
             LogWorldReplication.Value,
             LogWorldReplication.Value);
+        CoopUdpTransport.SetWorldEnvironmentReplicationPrefs(
+            WorldEnvironmentReplicationEnabled.Value,
+            WorldEnvironmentReplicationHz.Value,
+            LogWorldEnvironmentSync.Value);
         CoopUdpTransport.SetCombatReplicationPrefs(
             CombatReplicationEnabled.Value,
             LogCombatReplication.Value,
@@ -261,6 +276,7 @@ public sealed class CoopFoundationMod : MelonMod
             FragGrenadeCosmeticTntFallbackKg.Value,
             AtGrenadeJetVisualReplicationEnabled.Value);
         CoopCosmeticHealthCounters.TickLogIfDue();
+        ClientWorldProxyService.ConfigureCapture(ShowWorldProxies.Value);
         ClientSimulationGovernor.Configure(
             ClientSimulationSuppressionEnabled.Value,
             ClientSimulationCorrectionStrength.Value,
@@ -269,6 +285,8 @@ public sealed class CoopFoundationMod : MelonMod
             ClientSimulationSafeMode.Value);
         AimOverwriteProbe.Configure(ClientSimulationAimTrace.Value);
         CoopUdpTransport.ProcessInbound();
+        if (CoopUdpTransport.IsClient)
+            CoopWorldEnvironmentReplication.TryFlushPendingIfPossible(LogWorldEnvironmentSync.Value);
         CoopUdpTransport.DrainClientCombatApply();
         ClientSimulationGovernor.TickUpdate(Time.deltaTime);
         CoopUdpTransport.NetworkSessionTick();
@@ -291,6 +309,11 @@ public sealed class CoopFoundationMod : MelonMod
             ShowWorldProxies.Value,
             WorldProxySmoothing.Value,
             WorldProxyYOffset.Value);
+    }
+
+    public override void OnFixedUpdate()
+    {
+        ClientSimulationGovernor.TickFixedUpdate();
     }
 
     public override void OnApplicationQuit()

@@ -5,6 +5,7 @@ using GHPC;
 using GHPC.Weapons;
 using MelonLoader;
 using UnityEngine;
+using System.Linq;
 
 namespace GHPC.CoopFoundation.Net;
 
@@ -14,6 +15,13 @@ namespace GHPC.CoopFoundation.Net;
 /// </summary>
 internal static class ClientSimulationGovernor
 {
+    private enum MotionProfile
+    {
+        Unknown = 0,
+        Wheeled = 1,
+        Tracked = 2
+    }
+
     private enum SuppressDegradeReason
     {
         None = 0,
@@ -84,6 +92,15 @@ internal static class ClientSimulationGovernor
     private static readonly Dictionary<uint, BufferedState> BufferedByNetId = new();
     private static readonly HashSet<uint> SeenInFrame = new();
     private static readonly Dictionary<uint, AimBinding> AimBindingByNetId = new();
+    private static readonly Dictionary<uint, Vector3> PositionVelByNetId = new();
+    private static readonly Dictionary<uint, Vector3> NetVelocityByNetId = new();
+    private static readonly Dictionary<uint, List<(Behaviour Behaviour, bool WasEnabled)>> SuppressedDriversByNetId = new();
+    private static readonly Dictionary<uint, Rigidbody?> RigidBodyByNetId = new();
+    private static readonly Dictionary<uint, (bool IsKinematic, RigidbodyInterpolation Interpolation)> SuppressedRigidbodyStateByNetId = new();
+    private static readonly Dictionary<uint, (Vector3 Pos, Quaternion Rot, bool HardSnap)> PendingPhysicsApplyByNetId = new();
+    private static readonly Dictionary<uint, uint> HeavyCorrectionHitsByNetId = new();
+    private static readonly Dictionary<uint, MotionProfile> MotionProfileByNetId = new();
+    private static readonly Dictionary<uint, (float DtEwma, float JitterEwma, float DtMax)> UnitTimingByNetId = new();
 
     private static bool _enabled = true;
     private static float _strength = 1f;
@@ -119,6 +136,24 @@ internal static class ClientSimulationGovernor
     private static float _sessionMaxPosErr;
     private static float _sessionMaxRotErr;
     private static float _nextLogTime = float.NegativeInfinity;
+    private static float _lastMergedSnapshotTime = float.NegativeInfinity;
+    private static float _snapshotDtEwma = 0.2f;
+    private static float _snapshotJitterEwma;
+    private static float _snapshotDtMax;
+    private static uint _snapshotDtSamples;
+    private static readonly List<float> SnapshotDtWindow = new();
+    private static uint _interpSampleCount;
+    private static uint _interpUnderrunCount;
+    private static uint _wheeledSamples;
+    private static uint _trackedSamples;
+    private static uint _unknownSamples;
+    private static uint _wheeledCorrections;
+    private static uint _trackedCorrections;
+    private static uint _unknownCorrections;
+    private static uint _budgetDeferrals;
+    private static uint _overwriteRiskCount;
+    private static uint _physicsApplyCount;
+    private static uint _transformApplyCount;
 
     private const float LogCooldownSeconds = 2f;
     private const float SnapDistanceMeters = 30f;
@@ -127,7 +162,10 @@ internal static class ClientSimulationGovernor
     private const float CorrectAngleThresholdDegrees = 1.2f;
     private const float AimCorrectAngleThresholdDegrees = 0.35f;
     private const float SuppressRecoveryCooldownSeconds = 8f;
-    private const float InterpolationBackTimeSeconds = 0.2f;
+    private const float ExtrapolationClampSeconds = 0.08f;
+    private const float MinInterpolationBackTimeSeconds = 0.14f;
+    private const float MaxInterpolationBackTimeSeconds = 0.38f;
+    private const float InterpolationBackTimeBaseSeconds = 0.12f;
 
     public static void Configure(bool enabled, float strength, bool softSuppressEnabled, bool log, bool safeMode)
     {
@@ -143,6 +181,16 @@ internal static class ClientSimulationGovernor
         LogSessionSummaryIfAny();
         BufferedByNetId.Clear();
         SeenInFrame.Clear();
+        PositionVelByNetId.Clear();
+        NetVelocityByNetId.Clear();
+        RigidBodyByNetId.Clear();
+        PendingPhysicsApplyByNetId.Clear();
+        SuppressedDriversByNetId.Clear();
+        SuppressedRigidbodyStateByNetId.Clear();
+        HeavyCorrectionHitsByNetId.Clear();
+        MotionProfileByNetId.Clear();
+        UnitTimingByNetId.Clear();
+        SnapshotDtWindow.Clear();
         RestoreAllAimLoopsBestEffort();
         AimBindingByNetId.Clear();
         RestoreAllSuppressedUnitsBestEffort();
@@ -173,6 +221,23 @@ internal static class ClientSimulationGovernor
         _sessionMaxPosErr = 0f;
         _sessionMaxRotErr = 0f;
         _nextLogTime = float.NegativeInfinity;
+        _lastMergedSnapshotTime = float.NegativeInfinity;
+        _snapshotDtEwma = 0.2f;
+        _snapshotJitterEwma = 0f;
+        _snapshotDtMax = 0f;
+        _snapshotDtSamples = 0;
+        _interpSampleCount = 0;
+        _interpUnderrunCount = 0;
+        _wheeledSamples = 0;
+        _trackedSamples = 0;
+        _unknownSamples = 0;
+        _wheeledCorrections = 0;
+        _trackedCorrections = 0;
+        _unknownCorrections = 0;
+        _budgetDeferrals = 0;
+        _overwriteRiskCount = 0;
+        _physicsApplyCount = 0;
+        _transformApplyCount = 0;
     }
 
     public static void OnMergedWorldSnapshot(List<WorldEntityWire> entities)
@@ -181,6 +246,25 @@ internal static class ClientSimulationGovernor
             return;
         SeenInFrame.Clear();
         float now = Time.time;
+        if (_lastMergedSnapshotTime > 0f)
+        {
+            float dtMerge = now - _lastMergedSnapshotTime;
+            if (dtMerge > 1e-4f && dtMerge < 2f)
+            {
+                if (_snapshotDtSamples == 0)
+                    _snapshotDtEwma = dtMerge;
+                else
+                    _snapshotDtEwma = Mathf.Lerp(_snapshotDtEwma, dtMerge, 0.15f);
+                float jitterAbs = Mathf.Abs(dtMerge - _snapshotDtEwma);
+                _snapshotJitterEwma = Mathf.Lerp(_snapshotJitterEwma, jitterAbs, 0.18f);
+                _snapshotDtMax = Mathf.Max(_snapshotDtMax, dtMerge);
+                _snapshotDtSamples++;
+                SnapshotDtWindow.Add(dtMerge);
+                if (SnapshotDtWindow.Count > 512)
+                    SnapshotDtWindow.RemoveAt(0);
+            }
+        }
+        _lastMergedSnapshotTime = now;
         for (int i = 0; i < entities.Count; i++)
         {
             WorldEntityWire e = entities[i];
@@ -195,6 +279,31 @@ internal static class ClientSimulationGovernor
                 now);
             if (!BufferedByNetId.TryGetValue(e.NetId, out BufferedState buffered))
                 buffered = default;
+            if (buffered.HasNewer)
+            {
+                SnapshotState prev = buffered.Newer;
+                float dt = now - prev.SampleTime;
+                if (dt > 1e-4f && dt < 1.5f)
+                {
+                    Vector3 rawVel = (snap.Position - prev.Position) / dt;
+                    Vector3 oldVel = NetVelocityByNetId.TryGetValue(e.NetId, out Vector3 v) ? v : Vector3.zero;
+                    NetVelocityByNetId[e.NetId] = Vector3.Lerp(oldVel, rawVel, 0.35f);
+                    if (UnitTimingByNetId.TryGetValue(e.NetId, out var timing))
+                    {
+                        float dtEwma = timing.DtEwma <= 1e-4f ? dt : Mathf.Lerp(timing.DtEwma, dt, 0.2f);
+                        float jitter = Mathf.Lerp(timing.JitterEwma, Mathf.Abs(dt - dtEwma), 0.25f);
+                        UnitTimingByNetId[e.NetId] = (dtEwma, jitter, Mathf.Max(timing.DtMax, dt));
+                    }
+                    else
+                    {
+                        UnitTimingByNetId[e.NetId] = (dt, 0f, dt);
+                    }
+                }
+            }
+            else if (!NetVelocityByNetId.ContainsKey(e.NetId))
+            {
+                NetVelocityByNetId[e.NetId] = Vector3.zero;
+            }
             buffered.Push(snap);
             BufferedByNetId[e.NetId] = buffered;
         }
@@ -213,6 +322,15 @@ internal static class ClientSimulationGovernor
         {
             BufferedByNetId.Remove(stale[i]);
             AimBindingByNetId.Remove(stale[i]);
+            PositionVelByNetId.Remove(stale[i]);
+            NetVelocityByNetId.Remove(stale[i]);
+            RigidBodyByNetId.Remove(stale[i]);
+            PendingPhysicsApplyByNetId.Remove(stale[i]);
+            SuppressedDriversByNetId.Remove(stale[i]);
+            HeavyCorrectionHitsByNetId.Remove(stale[i]);
+            MotionProfileByNetId.Remove(stale[i]);
+            UnitTimingByNetId.Remove(stale[i]);
+            SuppressedRigidbodyStateByNetId.Remove(stale[i]);
         }
     }
 
@@ -243,7 +361,8 @@ internal static class ClientSimulationGovernor
         if (BufferedByNetId.Count == 0)
             return;
 
-        float renderTime = Time.time - InterpolationBackTimeSeconds;
+        float interpolationBackTime = GetAdaptiveInterpolationBackTime();
+        float renderTime = Time.time - interpolationBackTime;
         uint localControlledNetId = 0;
         Unit? localControlled = CoopSessionState.ControlledUnit;
         if (localControlled != null)
@@ -252,6 +371,8 @@ internal static class ClientSimulationGovernor
         float snapDistSq = SnapDistanceMeters * SnapDistanceMeters;
         float correctionDistSq = CorrectDistanceThresholdMeters * CorrectDistanceThresholdMeters;
         float lerpT = Mathf.Clamp01(deltaTime * Mathf.Max(0f, _strength) * 10f);
+        float smoothTime = Mathf.Clamp(0.12f / Mathf.Max(0.25f, _strength), 0.05f, 0.22f);
+        int correctionBudgetPerFrame = Mathf.Clamp(16 + BufferedByNetId.Count / 3, 16, 56);
         float posErrSum = 0f;
         float posErrMax = 0f;
         float rotErrSum = 0f;
@@ -270,6 +391,9 @@ internal static class ClientSimulationGovernor
                 if (isLocalOwned)
                 {
                     _ownershipSkipCount++;
+                    PositionVelByNetId.Remove(netId);
+                    NetVelocityByNetId.Remove(netId);
+                    PendingPhysicsApplyByNetId.Remove(netId);
                     continue;
                 }
                 Unit? unit = CoopUnitLookup.TryFindByNetId(netId);
@@ -285,16 +409,43 @@ internal static class ClientSimulationGovernor
                     _bufferMissCount++;
                     continue;
                 }
+                _interpSampleCount++;
+                if (kv.Value.HasNewer && renderTime >= kv.Value.Newer.SampleTime)
+                    _interpUnderrunCount++;
 
                 Transform t = unit.transform;
+                MotionProfile profile = ResolveMotionProfile(netId, unit);
+                if (profile == MotionProfile.Wheeled)
+                    _wheeledSamples++;
+                else if (profile == MotionProfile.Tracked)
+                    _trackedSamples++;
+                else
+                    _unknownSamples++;
                 Vector3 currentPos = t.position;
                 Quaternion currentRot = t.rotation;
                 Vector3 targetPos = targetState.Position;
+                float unitBackTime = GetPerUnitInterpolationBackTime(netId);
+                float jitterWeight = Mathf.Clamp01((unitBackTime - MinInterpolationBackTimeSeconds) / 0.24f);
+                if (NetVelocityByNetId.TryGetValue(netId, out Vector3 netVel))
+                {
+                    float speed = netVel.magnitude;
+                    float extrapolation = speed > 6f ? 0.022f : speed > 2.5f ? 0.035f : 0.052f;
+                    if (profile == MotionProfile.Wheeled)
+                        extrapolation *= 0.75f;
+                    extrapolation = Mathf.Lerp(extrapolation, extrapolation * 0.6f, jitterWeight);
+                    extrapolation = Mathf.Min(extrapolation, ExtrapolationClampSeconds);
+                    Vector3 offset = netVel * extrapolation;
+                    if (offset.sqrMagnitude > 0.09f)
+                        offset = offset.normalized * 0.3f;
+                    targetPos += offset;
+                }
                 Quaternion targetRot = targetState.HullRotation;
 
                 float posErrSq = (currentPos - targetPos).sqrMagnitude;
                 float rotErr = Quaternion.Angle(currentRot, targetRot);
                 float posErr = Mathf.Sqrt(posErrSq);
+                if (posErr > 0.5f)
+                    HeavyCorrectionHitsByNetId[netId] = HeavyCorrectionHitsByNetId.TryGetValue(netId, out uint c) ? c + 1 : 1;
                 posErrSum += posErr;
                 rotErrSum += rotErr;
                 if (posErr > posErrMax)
@@ -307,27 +458,84 @@ internal static class ClientSimulationGovernor
                 // whenever hull drift is below threshold.
                 TryApplyAimables(netId, unit, targetState.TurretWorldRotation, targetState.GunWorldRotation, lerpT);
 
-                bool needCorrect = posErrSq >= correctionDistSq || rotErr >= CorrectAngleThresholdDegrees;
+                float speedForDeadband = NetVelocityByNetId.TryGetValue(netId, out Vector3 sv) ? sv.magnitude : 0f;
+                float profileDeadband = profile == MotionProfile.Wheeled ? 0.22f : profile == MotionProfile.Tracked ? 0.13f : 0.16f;
+                profileDeadband += Mathf.Clamp(speedForDeadband * 0.01f, 0f, 0.08f);
+                float correctionDistSqAdaptive = Mathf.Max(correctionDistSq, profileDeadband * profileDeadband);
+                bool needCorrect = posErrSq >= correctionDistSqAdaptive || rotErr >= CorrectAngleThresholdDegrees;
                 if (!needCorrect)
                 {
                     _belowThresholdSkipCount++;
+                    continue;
+                }
+                if (_correctedThisFrame >= correctionBudgetPerFrame
+                    && posErr < 0.9f
+                    && rotErr < 4f)
+                {
+                    _budgetDeferrals++;
                     continue;
                 }
 
                 bool hardSnap = posErrSq >= snapDistSq || rotErr >= SnapAngleDegrees;
                 if (hardSnap)
                 {
-                    t.SetPositionAndRotation(targetPos, targetRot);
+                    if (TryQueuePhysicsApply(unit, netId, targetPos, targetRot, hardSnap: true))
+                    {
+                        // Physics owner will apply in FixedUpdate.
+                    }
+                    else
+                    {
+                        t.SetPositionAndRotation(targetPos, targetRot);
+                        _transformApplyCount++;
+                        if (profile == MotionProfile.Wheeled || profile == MotionProfile.Tracked)
+                            _overwriteRiskCount++;
+                    }
+                    PositionVelByNetId[netId] = Vector3.zero;
                     _snapCorrections++;
                 }
                 else
                 {
-                    // We still nudge instead of hard override to avoid fighting local sim too aggressively.
-                    t.SetPositionAndRotation(Vector3.Lerp(currentPos, targetPos, lerpT), Quaternion.Slerp(currentRot, targetRot, lerpT));
+                    // Motion-grade correction: damped positional convergence removes high-frequency sawtooth on fast movers.
+                    Vector3 vel = PositionVelByNetId.TryGetValue(netId, out Vector3 existingVel)
+                        ? existingVel
+                        : Vector3.zero;
+                    float profileSmoothTime = profile == MotionProfile.Wheeled
+                        ? smoothTime * 1.25f
+                        : profile == MotionProfile.Tracked
+                            ? smoothTime * 0.92f
+                            : smoothTime;
+                    profileSmoothTime = Mathf.Clamp(profileSmoothTime + jitterWeight * 0.04f, 0.05f, 0.30f);
+                    Vector3 blendedPos = Vector3.SmoothDamp(
+                        currentPos,
+                        targetPos,
+                        ref vel,
+                        profileSmoothTime,
+                        Mathf.Infinity,
+                        deltaTime);
+                    PositionVelByNetId[netId] = vel;
+                    float rotT = profile == MotionProfile.Wheeled ? lerpT * 0.85f : lerpT;
+                    Quaternion blendedRot = Quaternion.Slerp(currentRot, targetRot, rotT);
+                    if (TryQueuePhysicsApply(unit, netId, blendedPos, blendedRot, hardSnap: false))
+                    {
+                        // Physics owner will apply in FixedUpdate.
+                    }
+                    else
+                    {
+                        t.SetPositionAndRotation(blendedPos, blendedRot);
+                        _transformApplyCount++;
+                        if (profile == MotionProfile.Wheeled || profile == MotionProfile.Tracked)
+                            _overwriteRiskCount++;
+                    }
                 }
 
                 _correctedThisFrame++;
                 _totalCorrections++;
+                if (profile == MotionProfile.Wheeled)
+                    _wheeledCorrections++;
+                else if (profile == MotionProfile.Tracked)
+                    _trackedCorrections++;
+                else
+                    _unknownCorrections++;
             }
         }
         catch (Exception ex)
@@ -366,9 +574,39 @@ internal static class ClientSimulationGovernor
         if (_log && Time.time >= _nextLogTime && _correctedThisFrame > 0)
         {
             MelonLogger.Msg(
-                $"[CoopSim] corrected={_correctedThisFrame} total={_totalCorrections} snaps={_snapCorrections} suppress={_suppressedThisFrame}/{_suppressOpsTotal} restore={_restoredThisFrame}/{_restoreOpsTotal} desired={BufferedByNetId.Count} maxFrame={_maxCorrectedInFrame} strength={_strength:0.##} avgErrPos={_lastFrameAvgPosErr:0.##}m maxErrPos={_lastFrameMaxPosErr:0.##}m avgErrRot={_lastFrameAvgRotErr:0.#}deg maxErrRot={_lastFrameMaxRotErr:0.#}deg bufferMiss={_bufferMissCount}");
+                $"[CoopSim] corrected={_correctedThisFrame} total={_totalCorrections} snaps={_snapCorrections} suppress={_suppressedThisFrame}/{_suppressOpsTotal} restore={_restoredThisFrame}/{_restoreOpsTotal} desired={BufferedByNetId.Count} maxFrame={_maxCorrectedInFrame} strength={_strength:0.##} avgErrPos={_lastFrameAvgPosErr:0.##}m maxErrPos={_lastFrameMaxPosErr:0.##}m avgErrRot={_lastFrameAvgRotErr:0.#}deg maxErrRot={_lastFrameMaxRotErr:0.#}deg bufferMiss={_bufferMissCount} budgetDefers={_budgetDeferrals}");
             _nextLogTime = Time.time + LogCooldownSeconds;
         }
+    }
+
+    public static void TickFixedUpdate()
+    {
+        if (PendingPhysicsApplyByNetId.Count == 0 || !CoopSessionState.IsPlaying || !_enabled || _degradedToCorrectionOff)
+            return;
+        foreach (KeyValuePair<uint, (Vector3 Pos, Quaternion Rot, bool HardSnap)> kv in PendingPhysicsApplyByNetId)
+        {
+            uint netId = kv.Key;
+            Unit? unit = CoopUnitLookup.TryFindByNetId(netId);
+            if (unit == null)
+                continue;
+            Rigidbody? rb = ResolveRigidbody(netId, unit);
+            if (rb == null)
+                continue;
+            var st = kv.Value;
+            if (st.HardSnap)
+            {
+                rb.position = st.Pos;
+                rb.rotation = st.Rot;
+                rb.velocity = Vector3.zero;
+                rb.angularVelocity = Vector3.zero;
+            }
+            else
+            {
+                rb.MovePosition(st.Pos);
+                rb.MoveRotation(st.Rot);
+            }
+        }
+        PendingPhysicsApplyByNetId.Clear();
     }
 
     private static void LogSessionSummaryIfAny()
@@ -379,6 +617,19 @@ internal static class ClientSimulationGovernor
             $"[CoopSim][Summary] corrections={_totalCorrections} snaps={_snapCorrections} suppressOps={_suppressOpsTotal} restoreOps={_restoreOpsTotal} maxFrame={_maxCorrectedInFrame} degradedCorrection={_degradedToCorrectionOff} degradedSuppress={_degradedToSuppressOff} suppressReason={_suppressDegradeReason} desiredAtReset={BufferedByNetId.Count} sessionMaxPosErr={_sessionMaxPosErr:0.##}m sessionMaxRotErr={_sessionMaxRotErr:0.#}deg bufferMiss={_bufferMissCount}");
         MelonLogger.Msg(
             $"[CoopSim][Summary] seenUnits={_unitsSeenUnique} ownershipSkips={_ownershipSkipCount} thresholdSkips={_belowThresholdSkipCount} aimApplied={_aimApplyCount} aimMissing={_aimMissingCount} aimThresholdSkips={_aimBelowThresholdSkipCount}");
+        float p95Dt = GetSnapshotP95();
+        float underrunRatio = _interpSampleCount > 0 ? (float)_interpUnderrunCount / _interpSampleCount : 0f;
+        MelonLogger.Msg(
+            $"[CoopSim][Summary] timing dtAvg={_snapshotDtEwma:0.000}s dtP95={p95Dt:0.000}s dtMax={_snapshotDtMax:0.000}s jitter={_snapshotJitterEwma:0.000}s interpBack={GetAdaptiveInterpolationBackTime():0.000}s underrun={_interpUnderrunCount}/{_interpSampleCount} ({underrunRatio * 100f:0.#}%)");
+        MelonLogger.Msg(
+            $"[CoopSim][Summary] classes samples(w/t/u)={_wheeledSamples}/{_trackedSamples}/{_unknownSamples} corrections(w/t/u)={_wheeledCorrections}/{_trackedCorrections}/{_unknownCorrections} budgetDefers={_budgetDeferrals} apply(phys/xfm)={_physicsApplyCount}/{_transformApplyCount} overwriteRisk={_overwriteRiskCount}");
+        if (HeavyCorrectionHitsByNetId.Count > 0)
+        {
+            string top = string.Join(
+                ", ",
+                HeavyCorrectionHitsByNetId.OrderByDescending(kv => kv.Value).Take(5).Select(kv => $"{kv.Key}:{kv.Value}"));
+            MelonLogger.Msg($"[CoopSim][Summary] heavyCorrectionTop={top}");
+        }
     }
 
     private static bool TrySampleBuffered(in BufferedState buffered, float renderTime, out SnapshotState sampled)
@@ -401,7 +652,13 @@ internal static class ClientSimulationGovernor
         }
 
         float dt = b.SampleTime - a.SampleTime;
-        if (dt <= 0.0001f || renderTime >= b.SampleTime)
+        if (dt <= 0.0001f)
+        {
+            sampled = b;
+            return true;
+        }
+
+        if (renderTime >= b.SampleTime)
         {
             sampled = b;
             return true;
@@ -640,7 +897,9 @@ internal static class ClientSimulationGovernor
     {
         if (SuppressedByNetId.TryGetValue(netId, out bool already) && already)
             return;
-        if (!TrySetCrewAiEnabled(unit, enabled: false))
+        bool aiOk = TrySetCrewAiEnabled(unit, enabled: false);
+        bool driversOk = TrySetMovementDriversEnabled(unit, netId, enabled: false);
+        if (!aiOk && !driversOk)
             return;
         SuppressedByNetId[netId] = true;
         _suppressedThisFrame++;
@@ -651,8 +910,8 @@ internal static class ClientSimulationGovernor
     {
         if (!SuppressedByNetId.TryGetValue(netId, out bool wasSuppressed) || !wasSuppressed)
             return;
-        if (!TrySetCrewAiEnabled(unit, enabled: true))
-            return;
+        TrySetCrewAiEnabled(unit, enabled: true);
+        TrySetMovementDriversEnabled(unit, netId, enabled: true);
         SuppressedByNetId[netId] = false;
         _restoredThisFrame++;
         _restoreOpsTotal++;
@@ -702,6 +961,7 @@ internal static class ClientSimulationGovernor
             if (u == null)
                 continue;
             TrySetCrewAiEnabled(u, enabled: true);
+            TrySetMovementDriversEnabled(u, kv.Key, enabled: true);
         }
     }
 
@@ -715,5 +975,150 @@ internal static class ClientSimulationGovernor
             b.TraverseAp?.EnableAiming();
             b.GunAp?.EnableAiming();
         }
+    }
+
+    private static float GetAdaptiveInterpolationBackTime()
+    {
+        float adaptive = Mathf.Max(InterpolationBackTimeBaseSeconds, _snapshotDtEwma + _snapshotJitterEwma * 1.5f);
+        return Mathf.Clamp(adaptive, MinInterpolationBackTimeSeconds, MaxInterpolationBackTimeSeconds);
+    }
+
+    private static float GetPerUnitInterpolationBackTime(uint netId)
+    {
+        float baseBackTime = GetAdaptiveInterpolationBackTime();
+        if (!UnitTimingByNetId.TryGetValue(netId, out var timing))
+            return baseBackTime;
+        float adaptive = Mathf.Max(InterpolationBackTimeBaseSeconds, timing.DtEwma + timing.JitterEwma * 1.25f);
+        adaptive = Mathf.Clamp(adaptive, MinInterpolationBackTimeSeconds, MaxInterpolationBackTimeSeconds);
+        return Mathf.Max(baseBackTime * 0.92f, adaptive);
+    }
+
+    private static float GetSnapshotP95()
+    {
+        if (SnapshotDtWindow.Count == 0)
+            return 0f;
+        var arr = SnapshotDtWindow.ToArray();
+        Array.Sort(arr);
+        int idx = Mathf.Clamp(Mathf.CeilToInt(arr.Length * 0.95f) - 1, 0, arr.Length - 1);
+        return arr[idx];
+    }
+
+    private static bool TryQueuePhysicsApply(Unit unit, uint netId, Vector3 pos, Quaternion rot, bool hardSnap)
+    {
+        Rigidbody? rb = ResolveRigidbody(netId, unit);
+        if (rb == null || rb.isKinematic)
+            return false;
+        PendingPhysicsApplyByNetId[netId] = (pos, rot, hardSnap);
+        _physicsApplyCount++;
+        return true;
+    }
+
+    private static Rigidbody? ResolveRigidbody(uint netId, Unit unit)
+    {
+        if (RigidBodyByNetId.TryGetValue(netId, out Rigidbody? cached))
+            return cached;
+        Rigidbody? rb = unit.GetComponentInParent<Rigidbody>();
+        rb ??= unit.GetComponentInChildren<Rigidbody>();
+        RigidBodyByNetId[netId] = rb;
+        return rb;
+    }
+
+    private static bool TrySetMovementDriversEnabled(Unit unit, uint netId, bool enabled)
+    {
+        try
+        {
+            if (!enabled)
+            {
+                if (SuppressedDriversByNetId.ContainsKey(netId))
+                    return true;
+                Behaviour[] drivers = unit.GetComponentsInChildren<Behaviour>(true);
+                var suppressed = new List<(Behaviour Behaviour, bool WasEnabled)>(8);
+                for (int i = 0; i < drivers.Length; i++)
+                {
+                    Behaviour b = drivers[i];
+                    if (b == null || !b.enabled)
+                        continue;
+                    string? n = b.GetType().FullName;
+                    if (string.IsNullOrEmpty(n))
+                        continue;
+                    if (!n.Contains("VehicleController")
+                        && !n.Contains("DriverAI")
+                        && !n.Contains("DriverBrain")
+                        && !n.Contains("Navigator")
+                        && !n.Contains("PathDelayHandler"))
+                        continue;
+                    suppressed.Add((b, true));
+                    b.enabled = false;
+                }
+                SuppressedDriversByNetId[netId] = suppressed;
+                Rigidbody? rb = ResolveRigidbody(netId, unit);
+                if (rb != null)
+                {
+                    SuppressedRigidbodyStateByNetId[netId] = (rb.isKinematic, rb.interpolation);
+                    rb.isKinematic = true;
+                    rb.interpolation = RigidbodyInterpolation.None;
+                }
+                return suppressed.Count > 0;
+            }
+
+            if (!SuppressedDriversByNetId.TryGetValue(netId, out List<(Behaviour Behaviour, bool WasEnabled)>? list))
+                return true;
+            for (int i = 0; i < list.Count; i++)
+            {
+                var it = list[i];
+                if (it.Behaviour == null)
+                    continue;
+                if (it.WasEnabled)
+                    it.Behaviour.enabled = true;
+            }
+            SuppressedDriversByNetId.Remove(netId);
+            if (SuppressedRigidbodyStateByNetId.TryGetValue(netId, out var rbState))
+            {
+                Rigidbody? rb = ResolveRigidbody(netId, unit);
+                if (rb != null)
+                {
+                    rb.isKinematic = rbState.IsKinematic;
+                    rb.interpolation = rbState.Interpolation;
+                }
+                SuppressedRigidbodyStateByNetId.Remove(netId);
+            }
+            return true;
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[CoopSim] movement-driver suppress failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    private static MotionProfile ResolveMotionProfile(uint netId, Unit unit)
+    {
+        if (MotionProfileByNetId.TryGetValue(netId, out MotionProfile existing))
+            return existing;
+        MotionProfile profile = MotionProfile.Unknown;
+        Behaviour[] all = unit.GetComponentsInChildren<Behaviour>(true);
+        for (int i = 0; i < all.Length; i++)
+        {
+            Behaviour b = all[i];
+            if (b == null)
+                continue;
+            string? n = b.GetType().FullName;
+            if (string.IsNullOrEmpty(n))
+                continue;
+            if (n.IndexOf("Wheel", StringComparison.OrdinalIgnoreCase) >= 0
+                || n.IndexOf("Wheeled", StringComparison.OrdinalIgnoreCase) >= 0
+                || n.IndexOf("VehicleController", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                profile = MotionProfile.Wheeled;
+                break;
+            }
+            if (n.IndexOf("Track", StringComparison.OrdinalIgnoreCase) >= 0
+                || n.IndexOf("Tracked", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                profile = MotionProfile.Tracked;
+            }
+        }
+        MotionProfileByNetId[netId] = profile;
+        return profile;
     }
 }

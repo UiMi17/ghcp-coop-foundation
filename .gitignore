@@ -1,5 +1,6 @@
 bin/
 obj/
+dist/
 .vs/
 *.user
 *.suo
@@ -11,3 +12,4 @@ lib/MelonLoader/*.pdb
 lib/MelonLoader/*.exe
 *.md
 *.txt
+*.ps1
