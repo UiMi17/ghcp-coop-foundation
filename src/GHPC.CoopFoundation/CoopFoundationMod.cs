@@ -227,21 +227,24 @@ public sealed class CoopFoundationMod : MelonMod
         LoggerInstance.Msg(
             "Network: UDP GHP v3 + GHW world + GHC combat (+ ImpactFx + ParticleImpact + Explosion + muzzle replay + DamageState); COO (+ WorldEnv); phase5 governor; phase6 cosmetic channel.");
 
+        // Phase 6 M2: keep network menu-authoritative in main menu flow.
+        // We still apply transport prefs continuously in OnUpdate.
         CoopUdpTransport.ConfigureAndStart(
-            NetworkEnabled.Value,
-            NetworkRole.Value,
-            NetworkBindPort.Value,
-            NetworkRemoteHost.Value,
-            NetworkRemotePort.Value,
-            LogNetworkReceive.Value,
-            LogMissionMismatch.Value,
-            EnforceVehicleOwnership.Value,
-            LogVehicleOwnershipBlocks.Value);
+            enabled: false,
+            roleName: "Off",
+            bindPort: NetworkBindPort.Value,
+            remoteHost: NetworkRemoteHost.Value,
+            remotePort: NetworkRemotePort.Value,
+            logReceive: LogNetworkReceive.Value,
+            logMissionMismatch: LogMissionMismatch.Value,
+            enforceVehicleOwnership: EnforceVehicleOwnership.Value,
+            logVehicleOwnershipBlocks: LogVehicleOwnershipBlocks.Value);
     }
 
     public override void OnUpdate()
     {
         PatchSimpleRoundCoopCosmetic.TryApply(_harmony);
+        PatchBuildMenuControllerMultiplayerButton.TickLobbyControllers();
         CoopUdpTransport.SetWorldReplicationPrefs(
             WorldReplicationEnabled.Value,
             WorldReplicationHz.Value,

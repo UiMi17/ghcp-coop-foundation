@@ -53,6 +53,11 @@ internal static class ClientCombatApplier
     // Balanced profile: start shedding cosmetic-only events only under clear queue stress.
     private const int QueuePressureLowPriorityDropThreshold = 224;
     private const float HealthLogCooldownSeconds = 2f;
+    // Ignore tiny one-off overruns when queue is effectively empty.
+    private const int BudgetHitPendingWarnFloor = 4;
+    private const float BudgetHitHardOverrunRatio = 1.35f;
+    // Reserve a small tail for high-priority path; don't spend it on low-priority drain.
+    private const float LowPriorityDrainGuardMs = 2f;
 
     private struct PendingCombatPacket
     {
@@ -481,6 +486,12 @@ internal static class ClientCombatApplier
         int lowApplied = 0;
         while (PendingLow.Count > 0)
         {
+            if (capTime)
+            {
+                double elapsed = sw!.Elapsed.TotalMilliseconds;
+                if (elapsed >= Math.Max(0f, maxMs - LowPriorityDrainGuardMs))
+                    break;
+            }
             if (capCount && applied >= maxPackets)
             {
                 hitCountBudget = true;
@@ -518,12 +529,17 @@ internal static class ClientCombatApplier
         {
             string reason = hitCountBudget && hitTimeBudget ? "count+time" : hitCountBudget ? "count" : "time";
             double elapsedMs = sw?.Elapsed.TotalMilliseconds ?? 0d;
-            MelonLogger.Msg(
-                $"[CoopNet][Health] budget-hit reason={reason} applied={applied} pending={pendingDepth} elapsedMs={elapsedMs:0.##} capPackets={maxPackets} capMs={maxMs:0.##}");
-            _nextBudgetHitLogTime = now + HealthLogCooldownSeconds;
+            bool severe = pendingDepth >= BudgetHitPendingWarnFloor
+                          || (capTime && elapsedMs >= maxMs * BudgetHitHardOverrunRatio);
+            if (severe)
+            {
+                MelonLogger.Msg(
+                    $"[CoopNet][Health] budget-hit reason={reason} applied={applied} pending={pendingDepth} elapsedMs={elapsedMs:0.##} capPackets={maxPackets} capMs={maxMs:0.##}");
+                _nextBudgetHitLogTime = now + HealthLogCooldownSeconds;
+            }
         }
 
-        if (hitCountBudget || hitTimeBudget)
+        if ((hitCountBudget || hitTimeBudget) && pendingDepth >= BudgetHitPendingWarnFloor)
             _budgetHitCount++;
     }
 

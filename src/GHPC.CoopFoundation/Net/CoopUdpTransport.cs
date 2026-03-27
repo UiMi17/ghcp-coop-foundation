@@ -44,6 +44,8 @@ internal static class CoopUdpTransport
     private static bool _logReceive;
 
     private static bool _logMissionMismatch = true;
+    private static bool _enforceVehicleOwnership = true;
+    private static bool _logVehicleOwnershipBlocks;
 
     private static float _nextMissionMismatchLogTime = float.NegativeInfinity;
 
@@ -136,6 +138,9 @@ internal static class CoopUdpTransport
     private static bool _logWorldEnvironmentSync;
 
     private static uint _hostCombatSeq;
+    private static readonly CoopLobbySessionController LobbySession = new();
+    private static float _nextLobbyStaleLogTime = float.NegativeInfinity;
+    private const float LobbyStaleLogCooldownSeconds = 2f;
 
     public static bool IsNetworkActive => _started && _role != CoopNetRole.Off;
 
@@ -334,6 +339,8 @@ internal static class CoopUdpTransport
         Shutdown();
         _logReceive = logReceive;
         _logMissionMismatch = logMissionMismatch;
+        _enforceVehicleOwnership = enforceVehicleOwnership;
+        _logVehicleOwnershipBlocks = logVehicleOwnershipBlocks;
         if (!enabled)
         {
             _role = CoopNetRole.Off;
@@ -410,6 +417,117 @@ internal static class CoopUdpTransport
         CoopWorldEnvironmentReplication.ClearSession();
         _hostWorldEnvSendAccumulator = 0f;
         ResetCombatSessionState();
+        LobbySession.Reset();
+        if (!CoopNetSession.HasDisconnectReason)
+            CoopNetSession.NotifyDisconnect("transport stopped");
+    }
+
+    /// <summary>Menu entrypoint: start host transport if not already active.</summary>
+    public static bool TryStartHostFromMenu(int bindPort)
+    {
+        if (CoopSessionState.IsPlaying)
+            return false;
+        if (IsHost && _started)
+            return true;
+        if (IsClient && _started)
+            Shutdown();
+
+        ConfigureAndStart(
+            enabled: true,
+            roleName: "Host",
+            bindPort: bindPort <= 0 ? 27015 : bindPort,
+            remoteHost: "127.0.0.1",
+            remotePort: 27015,
+            logReceive: _logReceive,
+            logMissionMismatch: _logMissionMismatch,
+            enforceVehicleOwnership: _enforceVehicleOwnership,
+            logVehicleOwnershipBlocks: _logVehicleOwnershipBlocks);
+        if (IsHost)
+        {
+            ulong sessionId = LobbySession.EnsureHostSession();
+            LobbySession.BuildSnapshot(out _, out uint rev, out uint seq, out uint readyMask, out byte kind);
+            CoopNetSession.NotifyLobbySnapshotApplied(sessionId, rev, seq, readyMask, kind, isHost: true);
+        }
+
+        return IsHost;
+    }
+
+    /// <summary>Menu entrypoint: start client transport if not already active.</summary>
+    public static bool TryStartClientFromMenu(string remoteHost, int remotePort)
+    {
+        if (CoopSessionState.IsPlaying)
+            return false;
+        if (IsClient && _started && _serverEndPoint != null
+            && string.Equals(_serverEndPoint.Address.ToString(), remoteHost, StringComparison.OrdinalIgnoreCase)
+            && _serverEndPoint.Port == remotePort)
+            return true;
+        if (IsHost && _started)
+            Shutdown();
+
+        ConfigureAndStart(
+            enabled: true,
+            roleName: "Client",
+            bindPort: 0,
+            remoteHost: string.IsNullOrWhiteSpace(remoteHost) ? "127.0.0.1" : remoteHost,
+            remotePort: remotePort <= 0 ? 27015 : remotePort,
+            logReceive: _logReceive,
+            logMissionMismatch: _logMissionMismatch,
+            enforceVehicleOwnership: _enforceVehicleOwnership,
+            logVehicleOwnershipBlocks: _logVehicleOwnershipBlocks);
+
+        return IsClient;
+    }
+
+    public static bool TrySendClientReadyFromMenu(bool ready)
+    {
+        if (!IsClient || _udp == null || _controlSendBuffer == null || _serverEndPoint == null)
+            return false;
+        ulong sessionId = CoopNetSession.CurrentSessionId;
+        uint revision = CoopNetSession.CurrentRevision;
+        if (sessionId == 0)
+            return false;
+        try
+        {
+            CoopControlPacket.WriteLobbySetReadyRequest(_controlSendBuffer, sessionId, revision, ready);
+            _udp.Send(_controlSendBuffer, CoopControlPacket.LobbyControlPayloadLength, _serverEndPoint);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[CoopNet] SendLobbyReady failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    public static bool TryHostStartRequestFromMenu()
+    {
+        if (!IsHost || _udp == null || _controlSendBuffer == null)
+            return false;
+        if (_hostPeer == null)
+            return false;
+        if (!LobbySession.HostStartTransition(out uint transitionSeq))
+            return false;
+
+        LobbySession.BuildSnapshot(out ulong sessionId, out uint revision, out _, out uint readyMask, out byte transitionKind);
+        SendLobbyTransitionToPeer(_hostPeer, sessionId, revision, transitionSeq, transitionKind);
+        SendLobbySnapshotToPeer(_hostPeer, sessionId, revision, transitionSeq, readyMask, transitionKind);
+        CoopNetSession.NotifyLobbyTransitionApplied(sessionId, transitionSeq, transitionKind, isHost: true);
+        CoopNetSession.NotifyLobbySnapshotApplied(sessionId, revision, transitionSeq, readyMask, transitionKind, isHost: true);
+        MelonLogger.Msg($"[CoopNet][M3] transition-applied sid={sessionId} seq={transitionSeq} kind={transitionKind}");
+        return true;
+    }
+
+    /// <summary>Menu entrypoint: stop menu session safely.</summary>
+    public static void StopMenuSession(string reason)
+    {
+        if (CoopSessionState.IsPlaying)
+            return;
+        if (!_started)
+            return;
+        CoopNetSession.NotifyDisconnect(reason);
+        MelonLogger.Msg($"[CoopNet] Menu session stopped: {reason}");
+        LobbySession.Reset();
+        Shutdown();
     }
 
     /// <summary>Main-thread tick: Hello / Heartbeat (host-authoritative session).</summary>
@@ -601,6 +719,7 @@ internal static class CoopUdpTransport
         CoopWorldEnvironmentReplication.ClearSession();
         _hostWorldEnvSendAccumulator = 0f;
         ResetCombatSessionState();
+        LobbySession.Reset();
     }
 
     /// <summary>Host: periodic GHW + low-rate COO WorldEnv refresh to keep weather/sky authoritative on clients.</summary>
@@ -808,6 +927,77 @@ internal static class CoopUdpTransport
         if (length < 5)
             return;
         byte op = data[4];
+        if (op == CoopControlPacket.OpLobbySetReadyRequest && _role == CoopNetRole.Host)
+        {
+            if (!CoopControlPacket.TryReadLobbySetReadyRequest(data, length, out ulong sessionId, out _, out bool ready))
+                return;
+            if (LobbySession.SessionId != 0 && sessionId != LobbySession.SessionId)
+            {
+                LogLobbyStale("set-ready", sessionId, LobbySession.SessionId);
+                return;
+            }
+
+            EnsureHostPeerForOwnership(remote);
+            if (!LobbySession.HostApplyClientReady(ready))
+                return;
+            LobbySession.BuildSnapshot(out ulong sid, out uint rev, out uint seq, out uint readyMask, out byte kind);
+            SendLobbySnapshotToPeer(remote, sid, rev, seq, readyMask, kind);
+            CoopNetSession.NotifyLobbySnapshotApplied(sid, rev, seq, readyMask, kind, isHost: true);
+            MelonLogger.Msg($"[CoopNet][M3] snapshot-applied sid={sid} rev={rev} readyMask={readyMask}");
+            return;
+        }
+
+        if (op == CoopControlPacket.OpLobbyStartRequest && _role == CoopNetRole.Host)
+        {
+            if (!CoopControlPacket.TryReadLobbyStartRequest(data, length, out ulong sessionId, out _))
+                return;
+            if (LobbySession.SessionId != 0 && sessionId != LobbySession.SessionId)
+            {
+                LogLobbyStale("start-request", sessionId, LobbySession.SessionId);
+                return;
+            }
+
+            // In M3 host remains the only authority; remote start requests are ignored.
+            return;
+        }
+
+        if (op == CoopControlPacket.OpLobbySnapshot && _role == CoopNetRole.Client)
+        {
+            if (!CoopControlPacket.TryReadLobbySnapshot(
+                    data,
+                    length,
+                    out ulong sid,
+                    out uint rev,
+                    out uint seq,
+                    out uint readyMask,
+                    out byte kind))
+                return;
+            if (!LobbySession.ClientApplySnapshot(sid, rev, seq, readyMask, kind))
+            {
+                LogLobbyStale("snapshot", sid, LobbySession.SessionId);
+                return;
+            }
+
+            CoopNetSession.NotifyLobbySnapshotApplied(sid, rev, seq, readyMask, kind, isHost: false);
+            MelonLogger.Msg($"[CoopNet][M3] snapshot-applied sid={sid} rev={rev} readyMask={readyMask}");
+            return;
+        }
+
+        if (op == CoopControlPacket.OpLobbyTransition && _role == CoopNetRole.Client)
+        {
+            if (!CoopControlPacket.TryReadLobbyTransition(data, length, out ulong sid, out _, out uint seq, out byte kind))
+                return;
+            if (!LobbySession.ClientApplyTransition(sid, seq, kind))
+            {
+                LogLobbyStale("transition", sid, LobbySession.SessionId);
+                return;
+            }
+
+            CoopNetSession.NotifyLobbyTransitionApplied(sid, seq, kind, isHost: false);
+            MelonLogger.Msg($"[CoopNet][M3] transition-applied sid={sid} seq={seq} kind={kind}");
+            return;
+        }
+
         if (op == CoopControlPacket.OpHello && _role == CoopNetRole.Host)
         {
             if (length < CoopControlPacket.FixedControlPayloadLength
@@ -816,6 +1006,11 @@ internal static class CoopUdpTransport
             EnsureHostPeerForOwnership(remote);
             CoopNetSession.HostRegisterPeer(remote, out byte assigned);
             SendWelcome(remote, assigned, nonce);
+            ulong sid = LobbySession.EnsureHostSession();
+            LobbySession.BuildSnapshot(out _, out uint rev, out uint seq, out uint readyMask, out byte kind);
+            SendLobbySnapshotToPeer(remote, sid, rev, seq, readyMask, kind);
+            CoopNetSession.NotifyLobbySnapshotApplied(sid, rev, seq, readyMask, kind, isHost: true);
+            MelonLogger.Msg($"[CoopNet][M3] session-created sid={sid}");
             if (CoopSessionState.IsPlaying)
                 SendOwnerSync();
             return;
@@ -914,6 +1109,44 @@ internal static class CoopUdpTransport
                 return;
             CoopVehicleOwnership.ClientApplyOwnerSync(entries);
         }
+    }
+
+    private static void SendLobbySnapshotToPeer(IPEndPoint peer, ulong sessionId, uint revision, uint transitionSeq, uint readyMask, byte transitionKind)
+    {
+        if (_udp == null || _controlSendBuffer == null || peer == null)
+            return;
+        try
+        {
+            CoopControlPacket.WriteLobbySnapshot(_controlSendBuffer, sessionId, revision, transitionSeq, readyMask, transitionKind);
+            _udp.Send(_controlSendBuffer, CoopControlPacket.LobbyControlPayloadLength, peer);
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[CoopNet] SendLobbySnapshot failed: {ex.Message}");
+        }
+    }
+
+    private static void SendLobbyTransitionToPeer(IPEndPoint peer, ulong sessionId, uint revision, uint transitionSeq, byte transitionKind)
+    {
+        if (_udp == null || _controlSendBuffer == null || peer == null)
+            return;
+        try
+        {
+            CoopControlPacket.WriteLobbyTransition(_controlSendBuffer, sessionId, revision, transitionSeq, transitionKind);
+            _udp.Send(_controlSendBuffer, CoopControlPacket.LobbyControlPayloadLength, peer);
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[CoopNet] SendLobbyTransition failed: {ex.Message}");
+        }
+    }
+
+    private static void LogLobbyStale(string type, ulong incomingSessionId, ulong localSessionId)
+    {
+        if (Time.time < _nextLobbyStaleLogTime)
+            return;
+        _nextLobbyStaleLogTime = Time.time + LobbyStaleLogCooldownSeconds;
+        MelonLogger.Msg($"[CoopNet][M3] stale-dropped type={type} incomingSid={incomingSessionId} localSid={localSessionId}");
     }
 
     private static void ResetCombatSessionState()

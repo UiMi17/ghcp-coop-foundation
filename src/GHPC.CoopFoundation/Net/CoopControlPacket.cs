@@ -27,8 +27,13 @@ internal static class CoopControlPacket
 
     /// <summary>Host→client: <see cref="GHPC.World.WorldEnvironmentManager" /> snapshot (v1 fixed layout).</summary>
     public const byte OpWorldEnv = 8;
+    public const byte OpLobbySnapshot = 20;
+    public const byte OpLobbySetReadyRequest = 21;
+    public const byte OpLobbyStartRequest = 22;
+    public const byte OpLobbyTransition = 23;
 
     public const int FixedControlPayloadLength = 16;
+    public const int LobbyControlPayloadLength = 32;
 
     public const int SyncHeaderLength = 8;
 
@@ -177,6 +182,121 @@ internal static class CoopControlPacket
             return false;
         senderPeerId = data[5];
         seq = BitConverter.ToUInt32(data, 8);
+        return true;
+    }
+
+    public static void WriteLobbySetReadyRequest(byte[] buffer, ulong sessionId, uint revision, bool ready)
+    {
+        WriteLobbyPacketCore(buffer, OpLobbySetReadyRequest, sessionId, revision, 0, ready ? 1u : 0u, 0u);
+    }
+
+    public static bool TryReadLobbySetReadyRequest(byte[] data, int length, out ulong sessionId, out uint revision, out bool ready)
+    {
+        ready = false;
+        if (!TryReadLobbyPacketCore(data, length, OpLobbySetReadyRequest, out sessionId, out revision, out _, out uint flags, out _))
+            return false;
+        ready = (flags & 1u) != 0;
+        return true;
+    }
+
+    public static void WriteLobbyStartRequest(byte[] buffer, ulong sessionId, uint revision)
+    {
+        WriteLobbyPacketCore(buffer, OpLobbyStartRequest, sessionId, revision, 0, 0u, 0u);
+    }
+
+    public static bool TryReadLobbyStartRequest(byte[] data, int length, out ulong sessionId, out uint revision)
+    {
+        return TryReadLobbyPacketCore(data, length, OpLobbyStartRequest, out sessionId, out revision, out _, out _, out _);
+    }
+
+    public static void WriteLobbySnapshot(byte[] buffer, ulong sessionId, uint revision, uint transitionSeq, uint readyMask, byte transitionKind)
+    {
+        WriteLobbyPacketCore(buffer, OpLobbySnapshot, sessionId, revision, transitionSeq, readyMask, transitionKind);
+    }
+
+    public static bool TryReadLobbySnapshot(
+        byte[] data,
+        int length,
+        out ulong sessionId,
+        out uint revision,
+        out uint transitionSeq,
+        out uint readyMask,
+        out byte transitionKind)
+    {
+        if (!TryReadLobbyPacketCore(data, length, OpLobbySnapshot, out sessionId, out revision, out transitionSeq, out readyMask, out uint aux))
+        {
+            transitionKind = 0;
+            return false;
+        }
+
+        transitionKind = (byte)(aux & 0xFF);
+        return true;
+    }
+
+    public static void WriteLobbyTransition(byte[] buffer, ulong sessionId, uint revision, uint transitionSeq, byte transitionKind)
+    {
+        WriteLobbyPacketCore(buffer, OpLobbyTransition, sessionId, revision, transitionSeq, 0u, transitionKind);
+    }
+
+    public static bool TryReadLobbyTransition(
+        byte[] data,
+        int length,
+        out ulong sessionId,
+        out uint revision,
+        out uint transitionSeq,
+        out byte transitionKind)
+    {
+        if (!TryReadLobbyPacketCore(data, length, OpLobbyTransition, out sessionId, out revision, out transitionSeq, out _, out uint aux))
+        {
+            transitionKind = 0;
+            return false;
+        }
+
+        transitionKind = (byte)(aux & 0xFF);
+        return true;
+    }
+
+    private static void WriteLobbyPacketCore(byte[] buffer, byte op, ulong sessionId, uint revision, uint transitionSeq, uint flags, uint aux)
+    {
+        if (buffer.Length < LobbyControlPayloadLength)
+            throw new ArgumentException("buffer too small", nameof(buffer));
+        buffer[0] = Magic0;
+        buffer[1] = Magic1;
+        buffer[2] = Magic2;
+        buffer[3] = WireVersion1;
+        buffer[4] = op;
+        buffer[5] = 0;
+        buffer[6] = 0;
+        buffer[7] = 0;
+        BitConverter.GetBytes(sessionId).CopyTo(buffer, 8);
+        BitConverter.GetBytes(revision).CopyTo(buffer, 16);
+        BitConverter.GetBytes(transitionSeq).CopyTo(buffer, 20);
+        BitConverter.GetBytes(flags).CopyTo(buffer, 24);
+        BitConverter.GetBytes(aux).CopyTo(buffer, 28);
+    }
+
+    private static bool TryReadLobbyPacketCore(
+        byte[] data,
+        int length,
+        byte expectedOp,
+        out ulong sessionId,
+        out uint revision,
+        out uint transitionSeq,
+        out uint flags,
+        out uint aux)
+    {
+        sessionId = 0;
+        revision = 0;
+        transitionSeq = 0;
+        flags = 0;
+        aux = 0;
+        if (!IsCoopControl(data, length) || length < LobbyControlPayloadLength || data[4] != expectedOp)
+            return false;
+        sessionId = BitConverter.ToUInt64(data, 8);
+        revision = BitConverter.ToUInt32(data, 16);
+        transitionSeq = BitConverter.ToUInt32(data, 20);
+        flags = BitConverter.ToUInt32(data, 24);
+        aux = BitConverter.ToUInt32(data, 28);
         return true;
     }
 
