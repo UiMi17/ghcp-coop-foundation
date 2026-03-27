@@ -301,6 +301,28 @@ public sealed class CoopFoundationMod : MelonMod
             SnapshotLogIntervalSeconds.Value);
     }
 
+    public override void OnGUI()
+    {
+        if (!CoopClientPlanningGate.IsWaitingForHostPlanning)
+            return;
+
+        const int boxW = 540;
+        const int boxH = 88;
+        float x = (Screen.width - boxW) * 0.5f;
+        float y = Screen.height * 0.32f;
+        GUI.Box(new Rect(x - 14f, y - 14f, boxW + 28f, boxH + 28f), GUIContent.none);
+        var style = new GUIStyle(GUI.skin.label)
+        {
+            alignment = TextAnchor.MiddleCenter,
+            fontSize = 17,
+            wordWrap = true
+        };
+        GUI.Label(
+            new Rect(x, y, boxW, boxH),
+            "Co-op: waiting for host.\nThe host is completing tactical planning on the map.",
+            style);
+    }
+
     public override void OnLateUpdate()
     {
         if (CoopUdpTransport.IsHost)

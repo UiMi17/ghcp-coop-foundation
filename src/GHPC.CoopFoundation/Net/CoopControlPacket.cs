@@ -37,6 +37,9 @@ internal static class CoopControlPacket
     public const byte OpLobbyStartApproved = 26;
     public const byte OpLobbyMissionLaunchInfo = 27;
 
+    /// <summary>Host→client: host left UMC <c>Planning</c>; client should call <c>MissionStateController.EndPlanningPhase</c>.</summary>
+    public const byte OpMissionPlanningComplete = 28;
+
     public const int FixedControlPayloadLength = 16;
     public const int LobbyControlPayloadLength = 32;
 
@@ -314,6 +317,19 @@ internal static class CoopControlPacket
     {
         return TryReadLobbyPacketCore(data, length, OpLobbyStartApproved, out sessionId, out revision, out transitionSeq, out missionToken, out _);
     }
+
+    public static void WriteMissionPlanningComplete(byte[] buffer, ulong sessionId, uint revision, uint transitionSeq)
+    {
+        WriteLobbyPacketCore(buffer, OpMissionPlanningComplete, sessionId, revision, transitionSeq, 0u, 0u);
+    }
+
+    public static bool TryReadMissionPlanningComplete(
+        byte[] data,
+        int length,
+        out ulong sessionId,
+        out uint revision,
+        out uint transitionSeq) =>
+        TryReadLobbyPacketCore(data, length, OpMissionPlanningComplete, out sessionId, out revision, out transitionSeq, out _, out _);
 
     /// <returns>Total datagram length, or 0 if key too long / buffer too small.</returns>
     public static int WriteLobbyMissionLaunchInfo(byte[] buffer, ulong sessionId, uint revision, uint transitionSeq, string sceneMapKey)

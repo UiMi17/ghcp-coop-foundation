@@ -53,6 +53,10 @@
       <HintPath>$(GHPCManagedDir)\UnityEngine.UIModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="UnityEngine.IMGUIModule">
+      <HintPath>$(GHPCManagedDir)\UnityEngine.IMGUIModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="UnityEngine.TextRenderingModule">
       <HintPath>$(GHPCManagedDir)\UnityEngine.TextRenderingModule.dll</HintPath>
       <Private>false</Private>

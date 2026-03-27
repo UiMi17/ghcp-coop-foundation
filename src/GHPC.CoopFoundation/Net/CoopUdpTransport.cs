@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using GHPC.CoopFoundation;
+using GHPC.State;
 using MelonLoader;
 using UnityEngine;
 
@@ -161,6 +162,11 @@ internal static class CoopUdpTransport
     private static string? _clientMergeKey;
 
     private static bool _clientHasMergeKey;
+
+    /// <summary>Host: throttled resend of <see cref="CoopControlPacket.OpMissionPlanningComplete" /> (UDP loss / late Hello).</summary>
+    private static float _nextHostMissionPlanningCompleteResendTime = float.NegativeInfinity;
+
+    private const float HostMissionPlanningCompleteResendSeconds = 2.5f;
 
     public static bool IsNetworkActive => _started && _role != CoopNetRole.Off;
 
@@ -650,7 +656,9 @@ internal static class CoopUdpTransport
     /// <summary>Main-thread tick: Hello / Heartbeat (host-authoritative session).</summary>
     public static void NetworkSessionTick()
     {
-        CoopNetSession.Tick(Time.time);
+        float now = Time.time;
+        CoopNetSession.Tick(now);
+        HostTickMissionPlanningCompleteResync(now);
     }
 
     /// <summary>Drain async receives on the main thread.</summary>
@@ -842,6 +850,8 @@ internal static class CoopUdpTransport
         ClientClearMissionLaunchMergeState();
         CoopMissionLaunchBridge.Reset();
         CoopLobbyMissionSelection.Clear();
+        CoopClientPlanningGate.Clear();
+        _nextHostMissionPlanningCompleteResendTime = float.NegativeInfinity;
     }
 
     private static void ClientClearMissionLaunchMergeState()
@@ -1007,6 +1017,7 @@ internal static class CoopUdpTransport
             CoopControlPacket.WriteWelcome(_controlSendBuffer, assignedPeerId, nonceEcho);
             _udp.Send(_controlSendBuffer, CoopControlPacket.FixedControlPayloadLength, clientRemote);
             TrySendWorldEnvironmentToPeer(clientRemote);
+            HostTryPushMissionPlanningCompleteToPeerIfPlaying(clientRemote);
         }
         catch (Exception ex)
         {
@@ -1076,6 +1087,73 @@ internal static class CoopUdpTransport
         if (_hostPeer == null)
             return;
         TrySendWorldEnvironmentToPeer(_hostPeer);
+    }
+
+    /// <summary>Host→client: UMC planning finished; see <see cref="CoopControlPacket.OpMissionPlanningComplete" />.</summary>
+    internal static void HostBroadcastMissionPlanningComplete() =>
+        HostSendMissionPlanningCompleteToPeer(_hostPeer, logSend: true);
+
+    private static void HostTryPushMissionPlanningCompleteToPeerIfPlaying(IPEndPoint clientRemote)
+    {
+        if (!IsHost || _udp == null || _controlSendBuffer == null || clientRemote == null)
+            return;
+        if (!CoopNetSession.IsConnected)
+            return;
+        MissionStateController? msc = MissionStateController.Instance;
+        if (msc == null || !msc.IsUMCMission() || MissionStateController.CurrentState != MissionState.Playing)
+            return;
+
+        HostSendMissionPlanningCompleteToPeer(clientRemote, logSend: true);
+    }
+
+    private static void HostSendMissionPlanningCompleteToPeer(IPEndPoint? peer, bool logSend)
+    {
+        if (!IsHost || _udp == null || _controlSendBuffer == null || peer == null)
+            return;
+        if (!CoopNetSession.IsConnected)
+            return;
+        ulong sid = CoopNetSession.CurrentSessionId;
+        uint rev = CoopNetSession.CurrentRevision;
+        uint seq = CoopNetSession.CurrentTransitionSeq;
+        try
+        {
+            CoopControlPacket.WriteMissionPlanningComplete(_controlSendBuffer, sid, rev, seq);
+            _udp.Send(_controlSendBuffer, CoopControlPacket.LobbyControlPayloadLength, peer);
+            if (logSend)
+                MelonLogger.Msg($"[CoopNet] mission-planning-complete → peer sid={sid} rev={rev} seq={seq}");
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[CoopNet] mission-planning-complete send failed: {ex.Message}");
+        }
+    }
+
+    private static void HostTickMissionPlanningCompleteResync(float now)
+    {
+        if (!IsHost || _udp == null || _controlSendBuffer == null || _hostPeer == null || !CoopNetSession.IsConnected)
+        {
+            _nextHostMissionPlanningCompleteResendTime = float.NegativeInfinity;
+            return;
+        }
+
+        MissionStateController? msc = MissionStateController.Instance;
+        if (msc == null || !msc.IsUMCMission() || MissionStateController.CurrentState != MissionState.Playing)
+        {
+            _nextHostMissionPlanningCompleteResendTime = float.NegativeInfinity;
+            return;
+        }
+
+        if (float.IsNegativeInfinity(_nextHostMissionPlanningCompleteResendTime)
+            || _nextHostMissionPlanningCompleteResendTime < 0f)
+        {
+            _nextHostMissionPlanningCompleteResendTime = now + HostMissionPlanningCompleteResendSeconds;
+            return;
+        }
+
+        if (now < _nextHostMissionPlanningCompleteResendTime)
+            return;
+        _nextHostMissionPlanningCompleteResendTime = now + HostMissionPlanningCompleteResendSeconds;
+        HostSendMissionPlanningCompleteToPeer(_hostPeer, logSend: false);
     }
 
     private static void ProcessControlPacket(IPEndPoint remote, byte[] data, int length)
@@ -1252,6 +1330,21 @@ internal static class CoopUdpTransport
 
             CoopNetSession.NotifyStartApprovedApplied(sid, rev, seq, missionToken);
             MelonLogger.Msg($"[CoopNet][M4] start-approved sid={sid} seq={seq}");
+            return;
+        }
+
+        if (op == CoopControlPacket.OpMissionPlanningComplete && _role == CoopNetRole.Client)
+        {
+            if (!CoopControlPacket.TryReadMissionPlanningComplete(data, length, out ulong sid, out _, out _))
+                return;
+            if (LobbySession.SessionId != 0 && sid != LobbySession.SessionId)
+            {
+                LogLobbyStale("mission-planning-complete", sid, LobbySession.SessionId);
+                return;
+            }
+
+            MelonLogger.Msg($"[CoopNet] mission-planning-complete ← host sid={sid}");
+            CoopClientPlanningGate.ApplyHostPlanningCompleteFromNetwork();
             return;
         }
 
