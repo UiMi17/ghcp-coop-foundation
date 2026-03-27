@@ -13,8 +13,18 @@ internal static class PatchMissionStateController
     private static void Postfix(MissionState state)
     {
         CoopSessionState.SetMissionState(state);
-        if (state == MissionState.Playing && CoopUdpTransport.IsHost)
-            CoopUdpTransport.HostBroadcastWorldEnvironmentToPeer();
+        if (state == MissionState.Playing)
+        {
+            if (CoopUdpTransport.IsHost)
+            {
+                CoopUdpTransport.HostBroadcastWorldEnvironmentToPeer();
+                CoopUdpTransport.HostNotifyLocalMissionLoaded();
+            }
+            else if (CoopUdpTransport.IsClient)
+            {
+                CoopUdpTransport.TrySendClientLoadedAckForCurrentTransition();
+            }
+        }
         if (!HookDiagnostics.ShouldLog)
             return;
         MelonLogger.Msg($"[CoopDiag] MissionStateController.SetState → {state}");

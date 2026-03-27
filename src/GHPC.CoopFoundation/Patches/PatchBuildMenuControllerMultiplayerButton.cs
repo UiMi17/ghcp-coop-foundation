@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using GHPC.CoopFoundation.UI;
 using GHPC.UI;
@@ -19,6 +20,7 @@ internal static class PatchBuildMenuControllerMultiplayerButton
     private const string MultiplayerLabel = "Multiplayer";
     private const float MinReasonableStep = 10f;
     private static readonly bool VerboseUiProbeLogs = false;
+    private static readonly bool LogMissionUiState = true;
     private static readonly Dictionary<int, GameObject> SubMenuByController = new();
     private static readonly Dictionary<int, CoopLobbyMenuController> LobbyControllerByControllerId = new();
 
@@ -279,6 +281,14 @@ internal static class PatchBuildMenuControllerMultiplayerButton
             return;
 
         GameObject templateSubMenu = FindInstantActionTemplate(subMenus) ?? subMenus[0];
+        MissionMenuSetup? templateProbe = templateSubMenu.GetComponentInChildren<MissionMenuSetup>(true);
+        MelonLogger.Msg(
+            $"[CoopUI][MissionUI] Template for multiplayer clone: name={templateSubMenu.name} MissionMenuSetup={(templateProbe != null)}");
+        if (templateProbe == null)
+        {
+            MelonLogger.Warning(
+                "[CoopUI][MissionUI] Template has no MissionMenuSetup (some scenes only wire MissionBriefMenu). Will try injecting from a donor MissionMenuSetup at runtime.");
+        }
 
         Transform panelParent = templateSubMenu.transform.parent;
         if (panelParent == null)
@@ -287,11 +297,23 @@ internal static class PatchBuildMenuControllerMultiplayerButton
         // Clone native submenu object to keep animator/canvas-group and built-in submenu behavior.
         GameObject panel = UnityEngine.Object.Instantiate(templateSubMenu, panelParent);
         panel.name = MultiplayerSubMenuObjectName;
-        panel.SetActive(true);
         RectTransform panelRect = (RectTransform)panel.transform;
         panelRect.localScale = Vector3.one;
 
+        // Deactivate before injecting MissionMenuSetup so its Awake runs after serialized fields are wired.
+        panel.SetActive(false);
+        TryInjectMissionMenuSetupIfMissing(panel);
+        panel.SetActive(true);
+
         ConfigureInstantActionTemplateForMultiplayer(panel, controller, id);
+
+        MissionMenuSetup? cloneSetup = panel.GetComponentInChildren<MissionMenuSetup>(true);
+        MissionMenuSetup? templateSetup = templateSubMenu.GetComponentInChildren<MissionMenuSetup>(true);
+        if (templateSetup != null && cloneSetup == null)
+        {
+            MelonLogger.Warning(
+                $"[CoopUI][MissionUI] Instantiate lost MissionMenuSetup (template has component). template={templateSubMenu.name} clone={panel.name}");
+        }
 
         panel.SetActive(false);
         SubMenuByController[id] = panel;
@@ -302,6 +324,10 @@ internal static class PatchBuildMenuControllerMultiplayerButton
         AccessTools.Field(typeof(BuildMenuController), "_subMenus")?.SetValue(controller, expanded);
     }
 
+    /// <summary>
+    /// Prefer the submenu that includes <see cref="MissionMenuSetup" /> (theater dropdown + mission list).
+    /// Some scenes expose a panel that only has <see cref="MissionBriefMenu" />; cloning that omits list population.
+    /// </summary>
     private static GameObject? FindInstantActionTemplate(GameObject[] subMenus)
     {
         for (int i = 0; i < subMenus.Length; i++)
@@ -309,10 +335,126 @@ internal static class PatchBuildMenuControllerMultiplayerButton
             GameObject g = subMenus[i];
             if (g == null)
                 continue;
-            if (g.GetComponent("MissionBriefMenu") != null)
+            if (g.GetComponentInChildren<MissionMenuSetup>(true) != null)
                 return g;
         }
+
+        for (int i = 0; i < subMenus.Length; i++)
+        {
+            GameObject g = subMenus[i];
+            if (g == null)
+                continue;
+            if (g.GetComponentInChildren<MissionBriefMenu>(true) != null)
+                return g;
+        }
+
         return null;
+    }
+
+    /// <summary>
+    /// Some menu scenes (e.g. MainMenu2_Scene) use <c>InstantActionMenuPanel</c> with <see cref="MissionBriefMenu" /> but without
+    /// <see cref="MissionMenuSetup" /> on the prefab — theater options may be baked into the TMP_Dropdown, while the mission list
+    /// is only filled by <see cref="MissionMenuSetup.Awake" />. Copy serialized references from any other MissionMenuSetup in memory.
+    /// </summary>
+    private static void TryInjectMissionMenuSetupIfMissing(GameObject panel)
+    {
+        if (panel.GetComponentInChildren<MissionMenuSetup>(true) != null)
+            return;
+
+        MissionMenuSetup? donor = PickDonorMissionMenuSetup();
+        if (donor == null)
+        {
+            MelonLogger.Warning(
+                "[CoopUI][MissionUI] MissionMenuSetup inject skipped: no donor (scene has no MissionMenuSetup, Resources.FindObjectsOfTypeAll empty).");
+            return;
+        }
+
+        TMP_Dropdown? theaterDd = FindTheaterDropdown(panel);
+        GameObject? missionContent = FindMissionSelectContent(panel);
+        MissionBriefMenu? brief = panel.GetComponentInChildren<MissionBriefMenu>(true);
+        if (theaterDd == null || missionContent == null || brief == null)
+        {
+            MelonLogger.Warning(
+                $"[CoopUI][MissionUI] MissionMenuSetup inject skipped: missing UI refs (theaterDd={theaterDd != null} missionContent={missionContent != null} brief={brief != null}).");
+            return;
+        }
+
+        theaterDd.ClearOptions();
+
+        MissionMenuSetup setup = panel.AddComponent<MissionMenuSetup>();
+        AccessTools.Field(typeof(MissionMenuSetup), "_missionButtonPrefab")
+            .SetValue(setup, AccessTools.Field(typeof(MissionMenuSetup), "_missionButtonPrefab").GetValue(donor));
+        AccessTools.Field(typeof(MissionMenuSetup), "_missionButtonSpacerPrefab")
+            .SetValue(setup, AccessTools.Field(typeof(MissionMenuSetup), "_missionButtonSpacerPrefab").GetValue(donor));
+        AccessTools.Field(typeof(MissionMenuSetup), "_allMissionsScriptable")
+            .SetValue(setup, AccessTools.Field(typeof(MissionMenuSetup), "_allMissionsScriptable").GetValue(donor));
+        AccessTools.Field(typeof(MissionMenuSetup), "_lockedMissionScenes")
+            .SetValue(setup, AccessTools.Field(typeof(MissionMenuSetup), "_lockedMissionScenes").GetValue(donor));
+
+        AccessTools.Field(typeof(MissionMenuSetup), "_theaterDropdown").SetValue(setup, theaterDd);
+        AccessTools.Field(typeof(MissionMenuSetup), "_missionSelectContent").SetValue(setup, missionContent);
+        AccessTools.Field(typeof(MissionMenuSetup), "_missionBrief").SetValue(setup, brief);
+
+        MelonLogger.Msg(
+            $"[CoopUI][MissionUI] Injected MissionMenuSetup from donor '{donor.gameObject.name}' (template lacked component).");
+    }
+
+    private static MissionMenuSetup? PickDonorMissionMenuSetup()
+    {
+        MissionMenuSetup[] scene = UnityEngine.Object.FindObjectsOfType<MissionMenuSetup>(true);
+        for (int i = 0; i < scene.Length; i++)
+        {
+            MissionMenuSetup? m = scene[i];
+            if (m != null && IsPlausibleMissionMenuDonor(m))
+                return m;
+        }
+
+        MissionMenuSetup[] all = Resources.FindObjectsOfTypeAll<MissionMenuSetup>();
+        for (int i = 0; i < all.Length; i++)
+        {
+            MissionMenuSetup? m = all[i];
+            if (m != null && IsPlausibleMissionMenuDonor(m))
+                return m;
+        }
+
+        return null;
+    }
+
+    private static bool IsPlausibleMissionMenuDonor(MissionMenuSetup m)
+    {
+        if (m.gameObject.name.IndexOf(MultiplayerSubMenuObjectName, StringComparison.OrdinalIgnoreCase) >= 0)
+            return false;
+        object? prefab = AccessTools.Field(typeof(MissionMenuSetup), "_missionButtonPrefab").GetValue(m);
+        return prefab != null;
+    }
+
+    private static TMP_Dropdown? FindTheaterDropdown(GameObject panel)
+    {
+        Transform? t = panel.transform.Find("Theatre/Dropdown");
+        if (t != null)
+        {
+            TMP_Dropdown? dd = t.GetComponent<TMP_Dropdown>();
+            if (dd != null)
+                return dd;
+        }
+
+        TMP_Dropdown[] dropdowns = panel.GetComponentsInChildren<TMP_Dropdown>(true);
+        for (int i = 0; i < dropdowns.Length; i++)
+        {
+            TMP_Dropdown d = dropdowns[i];
+            string path = GetTransformPath(d.transform);
+            if (path.IndexOf("Template", StringComparison.OrdinalIgnoreCase) >= 0)
+                continue;
+            return d;
+        }
+
+        return null;
+    }
+
+    private static GameObject? FindMissionSelectContent(GameObject panel)
+    {
+        Transform? t = panel.transform.Find("Mission Scroller/Viewport/Content");
+        return t != null ? t.gameObject : null;
     }
 
     private static void ConfigureInstantActionTemplateForMultiplayer(GameObject panel, BuildMenuController controller, int controllerId)
@@ -320,68 +462,48 @@ internal static class PatchBuildMenuControllerMultiplayerButton
         if (VerboseUiProbeLogs)
             LogMultiplayerPanelDiagnostics(panel, "before-config");
 
-        // Keep native Instant Action layout and only remap controls/content for Multiplayer shell.
-        Component? missionBrief = panel.GetComponent("MissionBriefMenu");
-        if (missionBrief is Behaviour missionBehavior)
-            missionBehavior.enabled = false;
-
-        // Hide theater/mission selector at top for Multiplayer shell.
-        TMP_Dropdown? topDropdown = panel.GetComponentInChildren<TMP_Dropdown>(true);
-        if (topDropdown != null)
-        {
-            topDropdown.gameObject.SetActive(false);
-            DisableNearestPanel(topDropdown.gameObject, panel.transform);
-        }
-
-        ScrollRect? missionList = panel.GetComponentInChildren<ScrollRect>(true);
-        if (missionList != null)
-            DisableNearestPanel(missionList.gameObject, panel.transform);
+        // Keep native Instant Action layout active so mission list/preview can populate.
+        if (LogMissionUiState)
+            LogMissionSubmenuState(panel, "configure");
+        EnsureMissionSelectorVisible(panel);
 
         Button? startButton = FindButtonByLabel(panel, "START");
         if (startButton != null)
         {
-            startButton.onClick = new Button.ButtonClickedEvent();
-            startButton.onClick.AddListener(OnHostSessionClicked);
             startButton.enabled = true;
             startButton.interactable = true;
             SetButtonLabel(startButton.gameObject, "HOST SESSION");
         }
 
         Button? customizeButton = FindButtonByLabel(panel, "CUSTOMIZE");
+        Button? joinButton = null;
         if (customizeButton != null)
         {
-            customizeButton.onClick = new Button.ButtonClickedEvent();
-            customizeButton.onClick.AddListener(OnJoinSessionClicked);
             customizeButton.enabled = true;
             customizeButton.interactable = true;
-            SetButtonLabel(customizeButton.gameObject, "JOIN SESSION");
-        }
+            SetButtonLabel(customizeButton.gameObject, "CUSTOMIZE");
+            // Keep vanilla Customize listeners (mission config). Add a sibling for co-op join.
+            GameObject joinGo = UnityEngine.Object.Instantiate(customizeButton.gameObject, customizeButton.transform.parent);
+            joinGo.name = "CoopJoinSessionButton";
+            joinGo.transform.SetSiblingIndex(customizeButton.transform.GetSiblingIndex() + 1);
+            SetButtonLabel(joinGo, "JOIN SESSION");
+            joinButton = joinGo.GetComponent<Button>();
+            if (joinButton != null)
+            {
+                joinButton.onClick = new Button.ButtonClickedEvent();
+                joinButton.enabled = true;
+                joinButton.interactable = true;
+            }
 
-        // Disable mission-specific controls that should not drive gameplay in MultiplayerMenu shell.
-        Selectable[] selectables = panel.GetComponentsInChildren<Selectable>(true);
-        for (int i = 0; i < selectables.Length; i++)
-        {
-            Selectable s = selectables[i];
-            if (s == null)
-                continue;
-            if ((startButton != null && s == startButton) || (customizeButton != null && s == customizeButton))
-                continue;
-            s.interactable = false;
+            RectTransform? optionsParent = customizeButton.transform.parent as RectTransform;
+            if (optionsParent != null)
+                LayoutRebuilder.ForceRebuildLayoutImmediate(optionsParent);
         }
 
         SetFirstTextEqual(panel, "Scenario", "MULTIPLAYER");
-        SetFirstTextEqual(panel, "No briefing available.", "Create or join a co-op session.\nBack: ESC");
-        DisableNamedChild(panel.transform, "Map");
-        DisablePanelContainingText(panel, "MAP DATA");
-        DisablePanelContainingText(panel, "UNAVAILABLE");
-        HideTextContaining(panel, "MAP DATA");
-        HideTextContaining(panel, "UNAVAILABLE");
-        HideTextContaining(panel, "FACTION:");
-        HideTopQuadrantPanels(panel, startButton, customizeButton);
-        SuppressTopRightBoxVisuals(panel);
 
-        TMP_Text? briefingText = FindBriefingText(panel);
-        CoopLobbyMenuController lobbyController = new(controllerId, panel, startButton, customizeButton, briefingText);
+        TMP_Text? mapLobbyText = FindMapLobbyText(panel);
+        CoopLobbyMenuController lobbyController = new(controllerId, panel, startButton, joinButton, mapLobbyText);
         lobbyController.Bind();
         LobbyControllerByControllerId[controllerId] = lobbyController;
 
@@ -389,7 +511,8 @@ internal static class PatchBuildMenuControllerMultiplayerButton
             LogMultiplayerPanelDiagnostics(panel, "after-config");
     }
 
-    private static TMP_Text? FindBriefingText(GameObject root)
+    /// <summary>Large map preview text (normally "MAP DATA UNAVAILABLE") — repurposed for co-op lobby status.</summary>
+    private static TMP_Text? FindMapLobbyText(GameObject root)
     {
         TMP_Text[] tmps = root.GetComponentsInChildren<TMP_Text>(true);
         for (int i = 0; i < tmps.Length; i++)
@@ -398,12 +521,29 @@ internal static class PatchBuildMenuControllerMultiplayerButton
             if (t == null)
                 continue;
             string text = t.text ?? string.Empty;
-            if (text.IndexOf("co-op session", StringComparison.OrdinalIgnoreCase) >= 0
-                || text.IndexOf("briefing", StringComparison.OrdinalIgnoreCase) >= 0)
+            if (text.IndexOf("MAP DATA", StringComparison.OrdinalIgnoreCase) >= 0
+                || text.IndexOf("UNAVAILABLE", StringComparison.OrdinalIgnoreCase) >= 0)
                 return t;
         }
 
-        return null;
+        Transform? mapRoot = root.transform.Find("Map");
+        if (mapRoot == null)
+            return null;
+        TMP_Text[] mapTmps = mapRoot.GetComponentsInChildren<TMP_Text>(true);
+        TMP_Text? best = null;
+        for (int i = 0; i < mapTmps.Length; i++)
+        {
+            TMP_Text t = mapTmps[i];
+            if (t == null)
+                continue;
+            string path = GetTransformPath(t.transform);
+            if (path.IndexOf("Mission Title", StringComparison.OrdinalIgnoreCase) >= 0)
+                continue;
+            if (best == null || t.fontSize > best.fontSize)
+                best = t;
+        }
+
+        return best;
     }
 
     private static Button? FindButtonByLabel(GameObject root, string expectedLabelUpper)
@@ -745,6 +885,142 @@ internal static class PatchBuildMenuControllerMultiplayerButton
             // Match native submenu open flow (e.g., Instant Action): trigger title squash animation first.
             controller.TriggerMainMenuAnimation();
             controller.CollapseSubMenus(subMenu);
+            EnsureMissionSelectorVisible(panel);
+            TryKickMissionMenuSetup(panel);
+            if (LogMissionUiState)
+                LogMissionSubmenuState(panel, "after-open");
+        }
+    }
+
+    /// <summary>
+    /// Vanilla fills the mission list in <c>MissionMenuSetup.LoadTheater</c>, normally triggered from the Instant Action
+    /// submenu animation via <c>DelayedLoadTheater</c>. Our cloned submenu may never receive that path reliably.
+    /// </summary>
+    private static void TryKickMissionMenuSetup(GameObject panel)
+    {
+        MissionMenuSetup? setup = ResolveMissionMenuSetup(panel);
+        if (setup == null)
+        {
+            MelonLogger.Warning("[CoopUI][MissionUI] No MissionMenuSetup on multiplayer panel — mission list will stay empty.");
+            if (LogMissionUiState)
+                LogMonoBehavioursUnderPanelForDiagnostics(panel);
+            return;
+        }
+
+        try
+        {
+            setup.DelayedLoadTheater();
+            MelonLogger.Msg("[CoopUI][MissionUI] MissionMenuSetup.DelayedLoadTheater() — populate theater/mission list.");
+            if (LogMissionUiState)
+                setup.StartCoroutine(LogMissionUiAfterKick(setup, panel));
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[CoopUI][MissionUI] DelayedLoadTheater failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Prefer the same component instance the game uses; avoid <see cref="TMP_Dropdown" /> template ScrollRects.
+    /// </summary>
+    private static MissionMenuSetup? ResolveMissionMenuSetup(GameObject panel)
+    {
+        MissionMenuSetup? m = panel.GetComponent<MissionMenuSetup>();
+        if (m != null)
+            return m;
+        m = panel.GetComponentInChildren<MissionMenuSetup>(true);
+        return m;
+    }
+
+    private static void LogMonoBehavioursUnderPanelForDiagnostics(GameObject panel)
+    {
+        const int maxLines = 40;
+        int n = 0;
+        foreach (MonoBehaviour mb in panel.GetComponentsInChildren<MonoBehaviour>(true))
+        {
+            if (mb == null)
+                continue;
+            MelonLogger.Msg($"[CoopUI][MissionUI][diag] MB={mb.GetType().FullName} path={GetTransformPath(mb.transform)}");
+            if (++n >= maxLines)
+            {
+                MelonLogger.Msg("[CoopUI][MissionUI][diag] … truncated");
+                break;
+            }
+        }
+    }
+
+    /// <summary>Runs after vanilla MissionMenuSetup deferred theater load (3 end-frames + work).</summary>
+    private static IEnumerator LogMissionUiAfterKick(MonoBehaviour host, GameObject panel)
+    {
+        for (int i = 0; i < 8; i++)
+            yield return null;
+        LogMissionSubmenuState(panel, "after-kick-delayed");
+    }
+
+    private static void EnsureMissionSelectorVisible(GameObject panel)
+    {
+        ScrollRect? scroll = FindMissionListScrollRect(panel);
+        if (scroll == null)
+            return;
+
+        Transform? t = scroll.transform;
+        while (t != null && t != panel.transform)
+        {
+            if (!t.gameObject.activeSelf)
+                t.gameObject.SetActive(true);
+            t = t.parent;
+        }
+
+        if (!scroll.gameObject.activeSelf)
+            scroll.gameObject.SetActive(true);
+    }
+
+    /// <summary>
+    /// First ScrollRect in hierarchy is often the TMP dropdown item template, not the mission list.
+    /// </summary>
+    private static ScrollRect? FindMissionListScrollRect(GameObject panel)
+    {
+        ScrollRect[] scrolls = panel.GetComponentsInChildren<ScrollRect>(true);
+        for (int i = 0; i < scrolls.Length; i++)
+        {
+            ScrollRect sr = scrolls[i];
+            string name = sr.gameObject.name;
+            if (name.IndexOf("Dropdown", StringComparison.OrdinalIgnoreCase) >= 0)
+                continue;
+            if (name.IndexOf("Template", StringComparison.OrdinalIgnoreCase) >= 0)
+                continue;
+            return sr;
+        }
+
+        return scrolls.Length > 0 ? scrolls[0] : null;
+    }
+
+    private static void LogMissionSubmenuState(GameObject panel, string stage)
+    {
+        try
+        {
+            MissionBriefMenu? missionBrief = panel.GetComponentInChildren<MissionBriefMenu>(true);
+            string missionBriefType = missionBrief?.GetType().FullName ?? "null";
+            bool missionBriefEnabled = missionBrief != null && missionBrief.enabled;
+            MissionMenuSetup? missionSetup = ResolveMissionMenuSetup(panel);
+            TMP_Dropdown? dropdown = panel.GetComponentInChildren<TMP_Dropdown>(true);
+            ScrollRect[] scrolls = panel.GetComponentsInChildren<ScrollRect>(true);
+            int optionCount = dropdown?.options?.Count ?? -1;
+            ScrollRect? missionScroll = FindMissionListScrollRect(panel);
+            int contentChildren = missionScroll?.content?.childCount ?? -1;
+            MelonLogger.Msg(
+                $"[CoopUI][MissionUI] stage={stage} panelActive={panel.activeInHierarchy} missionBrief={missionBriefType} missionBriefEnabled={missionBriefEnabled} missionMenuSetup={(missionSetup != null)} dropdownActive={(dropdown != null && dropdown.gameObject.activeInHierarchy)} optionCount={optionCount} scrollRectCount={scrolls.Length} missionScrollActive={(missionScroll != null && missionScroll.gameObject.activeInHierarchy)} missionScrollContentChildren={contentChildren}");
+            for (int i = 0; i < scrolls.Length && i < 4; i++)
+            {
+                ScrollRect sr = scrolls[i];
+                int cc = sr.content != null ? sr.content.childCount : -1;
+                MelonLogger.Msg(
+                    $"[CoopUI][MissionUI]   scroll[{i}] active={sr.gameObject.activeInHierarchy} contentChildren={cc} path={GetTransformPath(sr.transform)}");
+            }
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[CoopUI][MissionUI] log-failed stage={stage} err={ex.Message}");
         }
     }
 
@@ -759,10 +1035,6 @@ internal static class PatchBuildMenuControllerMultiplayerButton
         }
         return null;
     }
-
-    private static void OnHostSessionClicked() { }
-
-    private static void OnJoinSessionClicked() { }
 
     private sealed class MenuButtonInfo
     {

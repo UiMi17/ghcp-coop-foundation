@@ -49,6 +49,10 @@ internal static class CoopNetSession
     private static bool _isReadyRemote;
     private static bool _canStartAsHost;
     private static CoopLobbyTransitionKind _transitionKind;
+    private static bool _isLoadRequested;
+    private static bool _isClientLoadedAcked;
+    private static bool _isStartApproved;
+    private static uint _currentMissionToken;
 
     public static void Reset()
     {
@@ -72,6 +76,10 @@ internal static class CoopNetSession
         _isReadyRemote = false;
         _canStartAsHost = false;
         _transitionKind = CoopLobbyTransitionKind.None;
+        _isLoadRequested = false;
+        _isClientLoadedAcked = false;
+        _isStartApproved = false;
+        _currentMissionToken = 0;
     }
 
     /// <summary>Menu / mission drop: client will Hello again next Playing; host clears endpoint→peer map.</summary>
@@ -154,6 +162,10 @@ internal static class CoopNetSession
     public static bool IsReadyRemote => _isReadyRemote;
     public static bool CanStartAsHost => _canStartAsHost;
     public static CoopLobbyTransitionKind CurrentTransitionKind => _transitionKind;
+    public static bool IsLoadRequested => _isLoadRequested;
+    public static bool IsClientLoadedAcked => _isClientLoadedAcked;
+    public static bool IsStartApproved => _isStartApproved;
+    public static uint CurrentMissionToken => _currentMissionToken;
 
     public static void NotifyLobbySnapshotApplied(
         ulong sessionId,
@@ -161,6 +173,8 @@ internal static class CoopNetSession
         uint transitionSeq,
         uint readyMask,
         byte transitionKind,
+        uint missionToken,
+        uint loadingFlags,
         bool isHost)
     {
         _currentSessionId = sessionId;
@@ -182,6 +196,16 @@ internal static class CoopNetSession
         }
 
         _transitionKind = (CoopLobbyTransitionKind)transitionKind;
+        _currentMissionToken = missionToken;
+        _isClientLoadedAcked = (loadingFlags & 2u) != 0;
+        bool hostLoaded = (loadingFlags & 1u) != 0;
+        _isLoadRequested = _transitionKind == CoopLobbyTransitionKind.LoadRequested
+            || _transitionKind == CoopLobbyTransitionKind.WaitingClientLoaded;
+        _isStartApproved = _transitionKind == CoopLobbyTransitionKind.StartApproved;
+        if (isHost)
+        {
+            _canStartAsHost = hostReady && clientReady && !_isLoadRequested && !_isStartApproved;
+        }
     }
 
     public static void NotifyLobbyTransitionApplied(ulong sessionId, uint transitionSeq, byte transitionKind, bool isHost)
@@ -192,6 +216,42 @@ internal static class CoopNetSession
         _transitionKind = (CoopLobbyTransitionKind)transitionKind;
         if (!isHost)
             _canStartAsHost = false;
+        _isLoadRequested = _transitionKind == CoopLobbyTransitionKind.LoadRequested
+            || _transitionKind == CoopLobbyTransitionKind.WaitingClientLoaded;
+        _isStartApproved = _transitionKind == CoopLobbyTransitionKind.StartApproved;
+    }
+
+    public static void NotifyLoadMissionReceived(ulong sessionId, uint revision, uint transitionSeq, uint missionToken, bool isHost)
+    {
+        _currentSessionId = sessionId;
+        _currentRevision = revision;
+        _currentTransitionSeq = transitionSeq;
+        _currentMissionToken = missionToken;
+        _transitionKind = CoopLobbyTransitionKind.LoadRequested;
+        _isLoadRequested = true;
+        _isStartApproved = false;
+        if (!isHost)
+            _canStartAsHost = false;
+    }
+
+    public static void NotifyClientLoadedAckApplied(ulong sessionId, uint revision, uint transitionSeq)
+    {
+        _currentSessionId = sessionId;
+        _currentRevision = revision;
+        _currentTransitionSeq = transitionSeq;
+        _isClientLoadedAcked = true;
+    }
+
+    public static void NotifyStartApprovedApplied(ulong sessionId, uint revision, uint transitionSeq, uint missionToken)
+    {
+        _currentSessionId = sessionId;
+        _currentRevision = revision;
+        _currentTransitionSeq = transitionSeq;
+        _currentMissionToken = missionToken;
+        _transitionKind = CoopLobbyTransitionKind.StartApproved;
+        _isLoadRequested = false;
+        _isStartApproved = true;
+        _isClientLoadedAcked = true;
     }
 
     /// <summary>Host: first connecting client gets peer id 2 (room for future expansion).</summary>

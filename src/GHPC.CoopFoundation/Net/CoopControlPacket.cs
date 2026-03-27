@@ -1,4 +1,5 @@
 using System;
+using System.Text;
 
 namespace GHPC.CoopFoundation.Net;
 
@@ -31,9 +32,20 @@ internal static class CoopControlPacket
     public const byte OpLobbySetReadyRequest = 21;
     public const byte OpLobbyStartRequest = 22;
     public const byte OpLobbyTransition = 23;
+    public const byte OpLobbyLoadMission = 24;
+    public const byte OpLobbyClientLoadedAck = 25;
+    public const byte OpLobbyStartApproved = 26;
+    public const byte OpLobbyMissionLaunchInfo = 27;
 
     public const int FixedControlPayloadLength = 16;
     public const int LobbyControlPayloadLength = 32;
+
+    /// <summary>COO magic (8) + session/revision/seq (16) + key length (2) + UTF-8 key (≤ <see cref="MissionLaunchInfoMaxKeyUtf8Bytes" />).</summary>
+    public const int MissionLaunchInfoFixedLength = 26;
+
+    public const int MissionLaunchInfoMaxKeyUtf8Bytes = 200;
+
+    public const int MissionLaunchInfoMaxTotalLength = MissionLaunchInfoFixedLength + MissionLaunchInfoMaxKeyUtf8Bytes;
 
     public const int SyncHeaderLength = 8;
 
@@ -254,6 +266,107 @@ internal static class CoopControlPacket
 
         transitionKind = (byte)(aux & 0xFF);
         return true;
+    }
+
+    public static void WriteLobbyLoadMission(byte[] buffer, ulong sessionId, uint revision, uint transitionSeq, uint missionToken)
+    {
+        WriteLobbyPacketCore(buffer, OpLobbyLoadMission, sessionId, revision, transitionSeq, missionToken, 0u);
+    }
+
+    public static bool TryReadLobbyLoadMission(
+        byte[] data,
+        int length,
+        out ulong sessionId,
+        out uint revision,
+        out uint transitionSeq,
+        out uint missionToken)
+    {
+        return TryReadLobbyPacketCore(data, length, OpLobbyLoadMission, out sessionId, out revision, out transitionSeq, out missionToken, out _);
+    }
+
+    public static void WriteLobbyClientLoadedAck(byte[] buffer, ulong sessionId, uint revision, uint transitionSeq)
+    {
+        WriteLobbyPacketCore(buffer, OpLobbyClientLoadedAck, sessionId, revision, transitionSeq, 1u, 0u);
+    }
+
+    public static bool TryReadLobbyClientLoadedAck(
+        byte[] data,
+        int length,
+        out ulong sessionId,
+        out uint revision,
+        out uint transitionSeq)
+    {
+        return TryReadLobbyPacketCore(data, length, OpLobbyClientLoadedAck, out sessionId, out revision, out transitionSeq, out _, out _);
+    }
+
+    public static void WriteLobbyStartApproved(byte[] buffer, ulong sessionId, uint revision, uint transitionSeq, uint missionToken)
+    {
+        WriteLobbyPacketCore(buffer, OpLobbyStartApproved, sessionId, revision, transitionSeq, missionToken, 0u);
+    }
+
+    public static bool TryReadLobbyStartApproved(
+        byte[] data,
+        int length,
+        out ulong sessionId,
+        out uint revision,
+        out uint transitionSeq,
+        out uint missionToken)
+    {
+        return TryReadLobbyPacketCore(data, length, OpLobbyStartApproved, out sessionId, out revision, out transitionSeq, out missionToken, out _);
+    }
+
+    /// <returns>Total datagram length, or 0 if key too long / buffer too small.</returns>
+    public static int WriteLobbyMissionLaunchInfo(byte[] buffer, ulong sessionId, uint revision, uint transitionSeq, string sceneMapKey)
+    {
+        if (buffer.Length < MissionLaunchInfoFixedLength)
+            return 0;
+        byte[] keyUtf8 = Encoding.UTF8.GetBytes(sceneMapKey ?? "");
+        if (keyUtf8.Length == 0 || keyUtf8.Length > MissionLaunchInfoMaxKeyUtf8Bytes)
+            return 0;
+        if (buffer.Length < MissionLaunchInfoFixedLength + keyUtf8.Length)
+            return 0;
+        buffer[0] = Magic0;
+        buffer[1] = Magic1;
+        buffer[2] = Magic2;
+        buffer[3] = WireVersion1;
+        buffer[4] = OpLobbyMissionLaunchInfo;
+        buffer[5] = 0;
+        buffer[6] = 0;
+        buffer[7] = 0;
+        BitConverter.GetBytes(sessionId).CopyTo(buffer, 8);
+        BitConverter.GetBytes(revision).CopyTo(buffer, 16);
+        BitConverter.GetBytes(transitionSeq).CopyTo(buffer, 20);
+        BitConverter.GetBytes((ushort)keyUtf8.Length).CopyTo(buffer, 24);
+        Buffer.BlockCopy(keyUtf8, 0, buffer, MissionLaunchInfoFixedLength, keyUtf8.Length);
+        return MissionLaunchInfoFixedLength + keyUtf8.Length;
+    }
+
+    public static bool TryReadLobbyMissionLaunchInfo(
+        byte[] data,
+        int length,
+        out ulong sessionId,
+        out uint revision,
+        out uint transitionSeq,
+        out string sceneMapKey)
+    {
+        sessionId = 0;
+        revision = 0;
+        transitionSeq = 0;
+        sceneMapKey = "";
+        if (!IsCoopControl(data, length) || data[4] != OpLobbyMissionLaunchInfo)
+            return false;
+        if (length < MissionLaunchInfoFixedLength)
+            return false;
+        sessionId = BitConverter.ToUInt64(data, 8);
+        revision = BitConverter.ToUInt32(data, 16);
+        transitionSeq = BitConverter.ToUInt32(data, 20);
+        int keyLen = BitConverter.ToUInt16(data, 24);
+        if (keyLen <= 0 || keyLen > MissionLaunchInfoMaxKeyUtf8Bytes)
+            return false;
+        if (length < MissionLaunchInfoFixedLength + keyLen)
+            return false;
+        sceneMapKey = Encoding.UTF8.GetString(data, MissionLaunchInfoFixedLength, keyLen);
+        return !string.IsNullOrEmpty(sceneMapKey);
     }
 
     private static void WriteLobbyPacketCore(byte[] buffer, byte op, ulong sessionId, uint revision, uint transitionSeq, uint flags, uint aux)

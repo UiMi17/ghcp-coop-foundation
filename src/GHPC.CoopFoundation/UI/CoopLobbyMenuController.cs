@@ -12,19 +12,19 @@ internal sealed class CoopLobbyMenuController
     private readonly GameObject _panel;
     private readonly Button? _hostButton;
     private readonly Button? _joinButton;
-    private readonly TMP_Text? _briefingText;
+    private readonly TMP_Text? _mapLobbyText;
     private readonly CoopLobbyMenuState _state = new();
     private bool _readyRequested;
     private float _nextAllowedClickTime;
     private const float ClickDebounceSeconds = 0.25f;
 
-    public CoopLobbyMenuController(int controllerId, GameObject panel, Button? hostButton, Button? joinButton, TMP_Text? briefingText)
+    public CoopLobbyMenuController(int controllerId, GameObject panel, Button? hostButton, Button? joinButton, TMP_Text? mapLobbyText)
     {
         _controllerId = controllerId;
         _panel = panel;
         _hostButton = hostButton;
         _joinButton = joinButton;
-        _briefingText = briefingText;
+        _mapLobbyText = mapLobbyText;
     }
 
     public void Bind()
@@ -64,9 +64,16 @@ internal sealed class CoopLobbyMenuController
                     string hs = CoopNetSession.HandshakeOk ? "ok" : "pending";
                     string sid = CoopNetSession.CurrentSessionId.ToString();
                     string transition = CoopNetSession.CurrentTransitionKind.ToString();
+                    string flowStatus = transition switch
+                    {
+                        nameof(CoopLobbyTransitionKind.LoadRequested) => "Loading mission...",
+                        nameof(CoopLobbyTransitionKind.WaitingClientLoaded) => "Waiting for client loaded ack...",
+                        nameof(CoopLobbyTransitionKind.StartApproved) => "Start approved.",
+                        _ => $"state={transition}"
+                    };
                     _state.MarkConnected(
                         $"{mode} connected ({hs}) sid={sid} rev={CoopNetSession.CurrentRevision} " +
-                        $"seq={CoopNetSession.CurrentTransitionSeq} state={transition}\nBack: ESC");
+                        $"seq={CoopNetSession.CurrentTransitionSeq} {flowStatus}\nBack: ESC");
                 }
             }
         }
@@ -141,27 +148,33 @@ internal sealed class CoopLobbyMenuController
 
     private void Render()
     {
-        if (_briefingText != null)
-            _briefingText.text = _state.StatusText;
+        if (_mapLobbyText != null)
+            _mapLobbyText.text = _state.StatusText;
 
         if (_hostButton != null)
         {
             bool isStarting = CoopNetSession.CurrentTransitionKind == CoopLobbyTransitionKind.Starting;
+            bool isLoadingGate = CoopNetSession.CurrentTransitionKind == CoopLobbyTransitionKind.LoadRequested
+                || CoopNetSession.CurrentTransitionKind == CoopLobbyTransitionKind.WaitingClientLoaded
+                || CoopNetSession.CurrentTransitionKind == CoopLobbyTransitionKind.StartApproved;
             bool hostCanStart = _state.Role == CoopLobbyRole.Host
                 && _state.Status == CoopLobbyStatus.Connected
                 && CoopNetSession.CanStartAsHost
-                && !isStarting;
+                && !isStarting
+                && !isLoadingGate;
             _hostButton.interactable = (_state.Status is CoopLobbyStatus.Idle or CoopLobbyStatus.Error) || hostCanStart;
             SetButtonLabel(
                 _hostButton.gameObject,
                 _state.Status == CoopLobbyStatus.Connected && _state.Role == CoopLobbyRole.Host
-                    ? (isStarting ? "STARTING..." : "START SESSION")
+                    ? (isStarting || isLoadingGate ? "STARTING..." : "START SESSION")
                     : "HOST SESSION");
         }
 
         if (_joinButton != null)
         {
-            _joinButton.interactable = true;
+            bool loadingGateActive = CoopNetSession.CurrentTransitionKind == CoopLobbyTransitionKind.LoadRequested
+                || CoopNetSession.CurrentTransitionKind == CoopLobbyTransitionKind.WaitingClientLoaded;
+            _joinButton.interactable = !loadingGateActive;
             SetButtonLabel(_joinButton.gameObject, CoopUdpTransport.IsNetworkActive ? "DISCONNECT" : "JOIN SESSION");
         }
     }
