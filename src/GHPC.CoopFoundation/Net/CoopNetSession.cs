@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Net;
+using GHPC.CoopFoundation;
 using MelonLoader;
 using UnityEngine;
 
@@ -54,7 +55,10 @@ internal static class CoopNetSession
     private static bool _isStartApproved;
     private static uint _currentMissionToken;
 
-    public static void Reset()
+    private static string _authoritativeHostBriefingSceneKey = "";
+
+    /// <param name="clearLastDisconnectReason">False when <see cref="CoopUdpTransport.Shutdown" /> should keep <see cref="LastDisconnectReason" /> for lobby UI (e.g. peer menu-disconnect).</param>
+    public static void Reset(bool clearLastDisconnectReason = true)
     {
         HostAssignedPeerByEndpoint.Clear();
         _clientHelloNonce = 0;
@@ -68,7 +72,8 @@ internal static class CoopNetSession
         _hostLastClientHeartbeatTime = 0f;
         _hostSawClientHeartbeat = false;
         _loggedStaleClientHeartbeat = false;
-        _lastDisconnectReason = string.Empty;
+        if (clearLastDisconnectReason)
+            _lastDisconnectReason = string.Empty;
         _currentSessionId = 0;
         _currentRevision = 0;
         _currentTransitionSeq = 0;
@@ -80,6 +85,8 @@ internal static class CoopNetSession
         _isClientLoadedAcked = false;
         _isStartApproved = false;
         _currentMissionToken = 0;
+        _authoritativeHostBriefingSceneKey = "";
+        CoopLobbyPlayerSlots.Reset();
     }
 
     /// <summary>Menu / mission drop: client will Hello again next Playing; host clears endpoint→peer map.</summary>
@@ -167,6 +174,14 @@ internal static class CoopNetSession
     public static bool IsStartApproved => _isStartApproved;
     public static uint CurrentMissionToken => _currentMissionToken;
 
+    /// <summary>Client: host’s canonical briefing key after network apply (empty until first briefing packet).</summary>
+    public static string AuthoritativeHostBriefingSceneKey => _authoritativeHostBriefingSceneKey;
+
+    public static void SetAuthoritativeHostBriefingSceneKey(string? sceneMapKey)
+    {
+        _authoritativeHostBriefingSceneKey = sceneMapKey ?? "";
+    }
+
     public static void NotifyLobbySnapshotApplied(
         ulong sessionId,
         uint revision,
@@ -206,6 +221,8 @@ internal static class CoopNetSession
         {
             _canStartAsHost = hostReady && clientReady && !_isLoadRequested && !_isStartApproved;
         }
+
+        CoopLobbyPlayerSlots.UpdateFromReadyMask(readyMask);
     }
 
     public static void NotifyLobbyTransitionApplied(ulong sessionId, uint transitionSeq, byte transitionKind, bool isHost)

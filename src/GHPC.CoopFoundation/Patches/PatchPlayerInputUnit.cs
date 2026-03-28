@@ -85,10 +85,11 @@ internal static class PatchPlayerInputSetDefaultUnit
     }
 
     [HarmonyPostfix]
-    private static void Postfix(IUnit? unit, object? __state)
+    private static void Postfix(PlayerInput __instance, IUnit? unit, object? __state)
     {
         if (unit is not Unit u)
             return;
         CoopVehicleOwnership.NotifyLocalUnitChanged(__state as Unit, u);
+        CoopCustomizeRowSpawnApply.TryApplyAfterSetDefaultUnit(__instance, u);
     }
 }

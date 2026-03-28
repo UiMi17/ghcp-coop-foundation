@@ -1,4 +1,5 @@
 using System;
+using GHPC.CoopFoundation;
 
 namespace GHPC.CoopFoundation.Net;
 
@@ -29,9 +30,17 @@ internal sealed class CoopLobbySessionController
     private bool _clientLoadedAck;
     private uint _selectedMissionToken;
     private CoopLobbyTransitionKind _transitionKind;
+    private byte _hostFriendlyUnitRowIndex;
+    private byte _clientFriendlyUnitRowIndex;
+
+    /// <summary>Host: last briefing key broadcast to client (Instant Action <c>SceneMissionKey</c> wire form).</summary>
+    private string _hostLobbyBriefingSceneKey = "";
 
     public ulong SessionId => _sessionId;
     public uint Revision => _revision;
+
+    /// <summary>Client: last applied lobby snapshot revision (for ordering briefing/flex vs snapshot).</summary>
+    public uint ClientLastAppliedLobbyRevision => _lastAppliedRevision;
     public uint TransitionSeq => _transitionSeq;
     public bool HostReady => _hostReady;
     public bool ClientReady => _clientReady;
@@ -39,6 +48,10 @@ internal sealed class CoopLobbySessionController
     public bool ClientLoadedAck => _clientLoadedAck;
     public uint SelectedMissionToken => _selectedMissionToken;
     public CoopLobbyTransitionKind TransitionKind => _transitionKind;
+
+    public byte HostFriendlyUnitRowIndex => _hostFriendlyUnitRowIndex;
+
+    public byte ClientFriendlyUnitRowIndex => _clientFriendlyUnitRowIndex;
 
     public void Reset()
     {
@@ -53,6 +66,10 @@ internal sealed class CoopLobbySessionController
         _clientLoadedAck = false;
         _selectedMissionToken = 0;
         _transitionKind = CoopLobbyTransitionKind.None;
+        _hostFriendlyUnitRowIndex = 0;
+        _clientFriendlyUnitRowIndex = 1;
+        _hostLobbyBriefingSceneKey = "";
+        CoopLobbyPlayerSlots.Reset();
     }
 
     public ulong EnsureHostSession()
@@ -74,7 +91,86 @@ internal sealed class CoopLobbySessionController
         _clientLoadedAck = false;
         _selectedMissionToken = 0;
         _transitionKind = CoopLobbyTransitionKind.WaitingForHost;
+        _hostFriendlyUnitRowIndex = 0;
+        _clientFriendlyUnitRowIndex = 1;
+        _hostLobbyBriefingSceneKey = "";
         return _sessionId;
+    }
+
+    /// <summary>Host: set canonical briefing key from menu without bumping revision (first session or post-reset).</summary>
+    public void HostSeedBriefingKeyIfUnset(string? sceneMapKey)
+    {
+        if (_sessionId == 0)
+            return;
+        if (!string.IsNullOrEmpty(_hostLobbyBriefingSceneKey))
+            return;
+        if (string.IsNullOrEmpty(sceneMapKey))
+            return;
+        _hostLobbyBriefingSceneKey = sceneMapKey!;
+    }
+
+    /// <summary>Host: user changed briefing; bumps revision when key changes.</summary>
+    public bool HostTrySetLobbyBriefingKey(string? sceneMapKey)
+    {
+        EnsureHostSession();
+        string next = sceneMapKey ?? "";
+        if (next == _hostLobbyBriefingSceneKey)
+            return false;
+        _hostLobbyBriefingSceneKey = next;
+        _revision++;
+        return true;
+    }
+
+    /// <summary>Host: Customize Apply changed <c>AllFlexOverrides</c>; bumps revision.</summary>
+    public void HostBumpRevisionForFlexOverrideSync()
+    {
+        EnsureHostSession();
+        _revision++;
+    }
+
+    public string HostLobbyBriefingSceneKey => _hostLobbyBriefingSceneKey;
+
+    /// <summary>Host wins: if client row equals host row, move client to the smallest byte value not equal to host.</summary>
+    private void NormalizeClientVersusHost()
+    {
+        if (_clientFriendlyUnitRowIndex != _hostFriendlyUnitRowIndex)
+            return;
+        for (int i = 0; i < 256; i++)
+        {
+            if (i != _hostFriendlyUnitRowIndex)
+            {
+                _clientFriendlyUnitRowIndex = (byte)i;
+                return;
+            }
+        }
+    }
+
+    /// <summary>Host: apply client’s requested friendly Customize row index; bumps revision if net state changed.</summary>
+    public bool HostApplyClientPlayerSlot(byte rowIndex)
+    {
+        EnsureHostSession();
+        byte prevHost = _hostFriendlyUnitRowIndex;
+        byte prevClient = _clientFriendlyUnitRowIndex;
+        _clientFriendlyUnitRowIndex = rowIndex;
+        NormalizeClientVersusHost();
+        if (_hostFriendlyUnitRowIndex == prevHost && _clientFriendlyUnitRowIndex == prevClient)
+            return false;
+        _revision++;
+        return true;
+    }
+
+    /// <summary>Host: local host row index change (Customize UI); bumps revision if net state changed.</summary>
+    public bool HostSetHostPlayerSlot(byte rowIndex)
+    {
+        EnsureHostSession();
+        byte prevHost = _hostFriendlyUnitRowIndex;
+        byte prevClient = _clientFriendlyUnitRowIndex;
+        _hostFriendlyUnitRowIndex = rowIndex;
+        NormalizeClientVersusHost();
+        if (_hostFriendlyUnitRowIndex == prevHost && _clientFriendlyUnitRowIndex == prevClient)
+            return false;
+        _revision++;
+        return true;
     }
 
     public bool HostApplyClientReady(bool ready)
@@ -200,6 +296,8 @@ internal sealed class CoopLobbySessionController
             readyMask |= 1u;
         if (_clientReady)
             readyMask |= 2u;
+        readyMask |= (uint)_hostFriendlyUnitRowIndex << CoopLobbyPlayerSlots.ReadyMaskHostRowShift;
+        readyMask |= (uint)_clientFriendlyUnitRowIndex << CoopLobbyPlayerSlots.ReadyMaskClientRowShift;
         transitionKind = (byte)_transitionKind;
         missionToken = _selectedMissionToken;
         loadingFlags = 0u;
@@ -230,6 +328,8 @@ internal sealed class CoopLobbySessionController
         _transitionSeq = transitionSeq;
         _hostReady = (readyMask & 1u) != 0;
         _clientReady = (readyMask & 2u) != 0;
+        _hostFriendlyUnitRowIndex = (byte)((readyMask >> CoopLobbyPlayerSlots.ReadyMaskHostRowShift) & 0xFF);
+        _clientFriendlyUnitRowIndex = (byte)((readyMask >> CoopLobbyPlayerSlots.ReadyMaskClientRowShift) & 0xFF);
         _transitionKind = (CoopLobbyTransitionKind)transitionKind;
         _selectedMissionToken = missionToken;
         _hostLoaded = (loadingFlags & 1u) != 0;

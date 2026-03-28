@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using GHPC.CoopFoundation;
+using GHPC.Mission;
 using GHPC.State;
 using MelonLoader;
 using UnityEngine;
@@ -58,6 +59,16 @@ internal static class CoopUdpTransport
     private static bool _started;
 
     private static byte[]? _controlSendBuffer;
+
+    private static byte[]? _lobbyVarSendBuffer;
+
+    private static uint? _clientPendingBriefingRevision;
+
+    private static string? _clientPendingBriefingKey;
+
+    private static uint? _clientPendingFlexRevision;
+
+    private static byte[]? _clientPendingFlexPayload;
 
     /// <summary>Prefs: host sends GHW world snapshots when true.</summary>
     private static bool _worldReplicationEnabled = true;
@@ -173,6 +184,9 @@ internal static class CoopUdpTransport
     public static bool IsHost => _started && _role == CoopNetRole.Host;
 
     public static bool IsClient => _started && _role == CoopNetRole.Client;
+
+    /// <summary>Host role: a client peer is connected (UDP endpoint known). When false, host may still configure lobby state locally.</summary>
+    public static bool HostHasLobbyPeer => _hostPeer != null;
 
     public static bool CombatReplicationEnabledPublic => _combatReplicationEnabled;
 
@@ -402,7 +416,10 @@ internal static class CoopUdpTransport
             int controlCap = CoopControlPacket.SyncHeaderLength + CoopControlPacket.MaxSyncEntries * 8;
             if (CoopControlPacket.MissionLaunchInfoMaxTotalLength > controlCap)
                 controlCap = CoopControlPacket.MissionLaunchInfoMaxTotalLength;
+            if (CoopControlPacket.LobbyFlexOverridesMaxTotalLength > controlCap)
+                controlCap = CoopControlPacket.LobbyFlexOverridesMaxTotalLength;
             _controlSendBuffer = new byte[controlCap];
+            _lobbyVarSendBuffer = new byte[CoopControlPacket.LobbyFlexOverridesMaxTotalLength];
             _started = true;
             CoopVehicleOwnership.Configure(_role == CoopNetRole.Host, enforceVehicleOwnership, logVehicleOwnershipBlocks);
             CoopNetSession.OnNetworkStarted(_role == CoopNetRole.Host);
@@ -432,11 +449,13 @@ internal static class CoopUdpTransport
         _hostPeer = null;
         _sendBuffer = null;
         _controlSendBuffer = null;
+        _lobbyVarSendBuffer = null;
+        ClientClearLobbyOrderingPending();
         _role = CoopNetRole.Off;
         lock (InboxLock)
             Inbox.Clear();
 
-        CoopNetSession.Reset();
+        CoopNetSession.Reset(clearLastDisconnectReason: false);
         CoopRemoteState.Clear();
         CoopVehicleOwnership.Clear();
         HostWorldReplication.Reset();
@@ -478,6 +497,7 @@ internal static class CoopUdpTransport
         if (IsHost)
         {
             ulong sessionId = LobbySession.EnsureHostSession();
+            LobbySession.HostSeedBriefingKeyIfUnset(CoopLobbyMissionSelection.LastSceneMapKey);
             LobbySession.BuildSnapshot(out _, out uint rev, out uint seq, out uint readyMask, out byte kind, out uint missionToken, out uint loadingFlags);
             CoopNetSession.NotifyLobbySnapshotApplied(
                 sessionId,
@@ -517,6 +537,87 @@ internal static class CoopUdpTransport
             logVehicleOwnershipBlocks: _logVehicleOwnershipBlocks);
 
         return IsClient;
+    }
+
+    /// <summary>Client: request friendly Customize unit-row index from host; host merges and broadcasts snapshot.</summary>
+    public static bool TrySendClientPlayerSlot(byte rowIndex)
+    {
+        if (!IsClient || _udp == null || _controlSendBuffer == null || _serverEndPoint == null)
+            return false;
+        ulong sessionId = CoopNetSession.CurrentSessionId;
+        uint revision = CoopNetSession.CurrentRevision;
+        uint transitionSeq = CoopNetSession.CurrentTransitionSeq;
+        if (sessionId == 0)
+            return false;
+        try
+        {
+            CoopControlPacket.WriteLobbyPlayerSlot(_controlSendBuffer, sessionId, revision, transitionSeq, rowIndex);
+            _udp.Send(_controlSendBuffer, CoopControlPacket.LobbyControlPayloadLength, _serverEndPoint);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[CoopNet] SendLobbyPlayerSlot failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>Host: apply local host Customize row index; broadcast snapshot when a peer is connected.</summary>
+    public static bool TryApplyLocalHostPlayerSlot(byte rowIndex)
+    {
+        if (!IsHost || _udp == null || _controlSendBuffer == null)
+            return false;
+        if (!LobbySession.HostSetHostPlayerSlot(rowIndex))
+            return true;
+        LobbySession.BuildSnapshot(
+            out ulong sid,
+            out uint rev,
+            out uint seq,
+            out uint readyMask,
+            out byte kind,
+            out uint missionToken,
+            out uint loadingFlags);
+        if (_hostPeer != null)
+            SendLobbySnapshotToPeer(_hostPeer, sid, rev, seq, readyMask, kind);
+        CoopNetSession.NotifyLobbySnapshotApplied(
+            sid,
+            rev,
+            seq,
+            readyMask,
+            kind,
+            missionToken,
+            loadingFlags,
+            isHost: true);
+        return true;
+    }
+
+    /// <summary>Host: set client row index locally (e.g. before client connects); same merge rules as client packet.</summary>
+    public static bool TryApplyLocalHostClientRowSlot(byte rowIndex)
+    {
+        if (!IsHost || _udp == null || _controlSendBuffer == null)
+            return false;
+        if (!LobbySession.HostApplyClientPlayerSlot(rowIndex))
+            return true;
+        LobbySession.BuildSnapshot(
+            out ulong sid,
+            out uint rev,
+            out uint seq,
+            out uint readyMask,
+            out byte kind,
+            out uint missionToken,
+            out uint loadingFlags);
+        if (_hostPeer != null)
+            SendLobbySnapshotToPeer(_hostPeer, sid, rev, seq, readyMask, kind);
+        CoopNetSession.NotifyLobbySnapshotApplied(
+            sid,
+            rev,
+            seq,
+            readyMask,
+            kind,
+            missionToken,
+            loadingFlags,
+            isHost: true);
+        return true;
     }
 
     public static bool TrySendClientReadyFromMenu(bool ready)
@@ -587,6 +688,199 @@ internal static class CoopUdpTransport
         return true;
     }
 
+    /// <summary>Host: briefing changed in menu; bumps revision and pushes briefing → flex → snapshot when a peer is connected.</summary>
+    public static void NotifyHostLocalBriefingChangedIfNeeded(string sceneMapKey)
+    {
+        if (!IsHost || _hostPeer == null || _udp == null)
+            return;
+        if (string.IsNullOrEmpty(sceneMapKey))
+            return;
+        if (!LobbySession.HostTrySetLobbyBriefingKey(sceneMapKey))
+            return;
+        HostPushLobbyVisualStateToPeer(_hostPeer, sendBriefingKey: true, sendFlexBlob: true, notifyHostSnapshot: true);
+    }
+
+    /// <summary>Host: Customize Apply saved flex overrides; bumps revision and pushes flex → snapshot.</summary>
+    public static void NotifyHostFlexOverridesChangedFromMenu()
+    {
+        if (!IsHost || _hostPeer == null || _udp == null)
+            return;
+        LobbySession.HostBumpRevisionForFlexOverrideSync();
+        HostPushLobbyVisualStateToPeer(_hostPeer, sendBriefingKey: false, sendFlexBlob: true, notifyHostSnapshot: true);
+    }
+
+    private static void ClientClearLobbyOrderingPending()
+    {
+        _clientPendingBriefingRevision = null;
+        _clientPendingBriefingKey = null;
+        _clientPendingFlexRevision = null;
+        _clientPendingFlexPayload = null;
+    }
+
+    private static void HostPushLobbyVisualStateToPeer(
+        IPEndPoint peer,
+        bool sendBriefingKey,
+        bool sendFlexBlob,
+        bool notifyHostSnapshot)
+    {
+        if (_udp == null || peer == null)
+            return;
+        LobbySession.BuildSnapshot(
+            out ulong sessionId,
+            out uint revision,
+            out uint transitionSeq,
+            out uint readyMask,
+            out byte transitionKind,
+            out uint missionToken,
+            out uint loadingFlags);
+        if (sendBriefingKey && !string.IsNullOrEmpty(LobbySession.HostLobbyBriefingSceneKey))
+            SendLobbyMissionBriefingKeyToPeer(peer, sessionId, revision, 0u, LobbySession.HostLobbyBriefingSceneKey);
+        if (sendFlexBlob && !string.IsNullOrEmpty(CoopLobbyMissionSelection.LastFlexMissionName))
+        {
+            string flexName = CoopLobbyMissionSelection.LastFlexMissionName;
+            DynamicMissionMetadataOverrides? o = DynamicMissionLauncher.GetFlexOverrides(flexName);
+            byte[] blob = CoopFlexOverridesWire.Serialize(flexName, o);
+            SendLobbyFlexOverridesToPeer(peer, sessionId, revision, 0u, blob);
+        }
+
+        SendLobbySnapshotToPeer(peer, sessionId, revision, transitionSeq, readyMask, transitionKind);
+        if (notifyHostSnapshot)
+        {
+            CoopNetSession.NotifyLobbySnapshotApplied(
+                sessionId,
+                revision,
+                transitionSeq,
+                readyMask,
+                transitionKind,
+                missionToken,
+                loadingFlags,
+                isHost: true);
+        }
+    }
+
+    private static void ClientApplyNetworkBriefingKey(string key)
+    {
+        CoopLobbyMissionUiSync.ApplyHostBriefingFromNetwork(key);
+    }
+
+    private static void ClientApplyNetworkFlexPayload(byte[] payload)
+    {
+        if (CoopFlexOverridesWire.TryApplyToGame(payload, out _))
+            CoopLobbyMissionUiSync.RefreshMissionConfigPanelsAndSlots();
+    }
+
+    private static void ClientQueueOrApplyBriefingKey(ulong sid, uint rev, string key)
+    {
+        if (LobbySession.SessionId != 0 && sid != LobbySession.SessionId)
+            return;
+        if (rev < LobbySession.ClientLastAppliedLobbyRevision)
+            return;
+        if (rev == LobbySession.ClientLastAppliedLobbyRevision)
+        {
+            ClientApplyNetworkBriefingKey(key);
+            return;
+        }
+
+        _clientPendingBriefingRevision = rev;
+        _clientPendingBriefingKey = key;
+    }
+
+    private static void ClientQueueOrApplyFlexPayload(ulong sid, uint rev, byte[] payload)
+    {
+        if (LobbySession.SessionId != 0 && sid != LobbySession.SessionId)
+            return;
+        if (rev < LobbySession.ClientLastAppliedLobbyRevision)
+            return;
+        if (rev == LobbySession.ClientLastAppliedLobbyRevision)
+        {
+            ClientApplyNetworkFlexPayload(payload);
+            return;
+        }
+
+        _clientPendingFlexRevision = rev;
+        _clientPendingFlexPayload = payload;
+    }
+
+    private static void ClientFlushLobbyOrderingAfterSnapshot(uint appliedRevision)
+    {
+        if (_clientPendingBriefingRevision == appliedRevision && !string.IsNullOrEmpty(_clientPendingBriefingKey))
+        {
+            ClientApplyNetworkBriefingKey(_clientPendingBriefingKey!);
+            _clientPendingBriefingRevision = null;
+            _clientPendingBriefingKey = null;
+        }
+
+        if (_clientPendingFlexRevision == appliedRevision && _clientPendingFlexPayload != null)
+        {
+            ClientApplyNetworkFlexPayload(_clientPendingFlexPayload);
+            _clientPendingFlexRevision = null;
+            _clientPendingFlexPayload = null;
+        }
+    }
+
+    private static void SendLobbyMissionBriefingKeyToPeer(
+        IPEndPoint peer,
+        ulong sessionId,
+        uint revision,
+        uint transitionSeq,
+        string sceneMapKey)
+    {
+        if (_udp == null || _controlSendBuffer == null || peer == null)
+            return;
+        try
+        {
+            int len = CoopControlPacket.WriteLobbyMissionBriefingKey(
+                _controlSendBuffer,
+                sessionId,
+                revision,
+                transitionSeq,
+                sceneMapKey);
+            if (len <= 0)
+            {
+                MelonLogger.Warning("[CoopNet][Lobby] SendLobbyMissionBriefingKey: key too long or empty");
+                return;
+            }
+
+            _udp.Send(_controlSendBuffer, len, peer);
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[CoopNet][Lobby] SendLobbyMissionBriefingKey failed: {ex.Message}");
+        }
+    }
+
+    private static void SendLobbyFlexOverridesToPeer(
+        IPEndPoint peer,
+        ulong sessionId,
+        uint revision,
+        uint transitionSeq,
+        byte[] blob)
+    {
+        if (_udp == null || _lobbyVarSendBuffer == null || peer == null)
+            return;
+        try
+        {
+            int len = CoopControlPacket.WriteLobbyFlexOverrides(
+                _lobbyVarSendBuffer,
+                sessionId,
+                revision,
+                transitionSeq,
+                blob,
+                blob.Length);
+            if (len <= 0)
+            {
+                MelonLogger.Warning("[CoopNet][Lobby] SendLobbyFlexOverrides: blob too large");
+                return;
+            }
+
+            _udp.Send(_lobbyVarSendBuffer, len, peer);
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[CoopNet][Lobby] SendLobbyFlexOverrides failed: {ex.Message}");
+        }
+    }
+
     public static void HostNotifyLocalMissionLoaded()
     {
         if (!IsHost)
@@ -647,10 +941,54 @@ internal static class CoopUdpTransport
             return;
         if (!_started)
             return;
+        TrySendMenuDisconnectAnnouncement();
         CoopNetSession.NotifyDisconnect(reason);
         MelonLogger.Msg($"[CoopNet] Menu session stopped: {reason}");
         LobbySession.Reset();
         Shutdown();
+    }
+
+    private static bool _handlingRemoteMenuDisconnect;
+
+    private static void TrySendMenuDisconnectAnnouncement()
+    {
+        if (_udp == null || _controlSendBuffer == null || !_started)
+            return;
+        if (CoopSessionState.IsPlaying)
+            return;
+        ulong sid = CoopNetSession.CurrentSessionId;
+        uint rev = CoopNetSession.CurrentRevision;
+        uint seq = CoopNetSession.CurrentTransitionSeq;
+        CoopControlPacket.WriteLobbyMenuDisconnect(_controlSendBuffer, sid, rev, seq);
+        try
+        {
+            if (_role == CoopNetRole.Host && _hostPeer != null)
+                _udp.Send(_controlSendBuffer, CoopControlPacket.LobbyControlPayloadLength, _hostPeer);
+            else if (_role == CoopNetRole.Client && _serverEndPoint != null)
+                _udp.Send(_controlSendBuffer, CoopControlPacket.LobbyControlPayloadLength, _serverEndPoint);
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[CoopNet] Send menu-disconnect failed: {ex.Message}");
+        }
+    }
+
+    private static void ApplyRemoteMenuDisconnectFromPeer(string remoteLabel)
+    {
+        if (_handlingRemoteMenuDisconnect || !_started || CoopSessionState.IsPlaying)
+            return;
+        _handlingRemoteMenuDisconnect = true;
+        try
+        {
+            CoopNetSession.NotifyDisconnect("peer disconnected");
+            MelonLogger.Msg($"[CoopNet] Menu disconnect from peer {remoteLabel}");
+            LobbySession.Reset();
+            Shutdown();
+        }
+        finally
+        {
+            _handlingRemoteMenuDisconnect = false;
+        }
     }
 
     /// <summary>Main-thread tick: Hello / Heartbeat (host-authoritative session).</summary>
@@ -1160,6 +1498,35 @@ internal static class CoopUdpTransport
     {
         if (length < 5)
             return;
+        if (length >= CoopControlPacket.LobbyControlPayloadLength && data[4] == CoopControlPacket.OpLobbyMenuDisconnect)
+        {
+            if (!CoopControlPacket.TryReadLobbyMenuDisconnect(data, length, out ulong menuDiscSid, out _, out _))
+                return;
+            if (CoopSessionState.IsPlaying)
+                return;
+            if (LobbySession.SessionId != 0 && menuDiscSid != 0 && menuDiscSid != LobbySession.SessionId)
+            {
+                LogLobbyStale("menu-disconnect", menuDiscSid, LobbySession.SessionId);
+                return;
+            }
+
+            if (_role == CoopNetRole.Host)
+            {
+                if (CoopNetSession.HostGetExpectedPeerId(remote) == 0)
+                    return;
+            }
+            else if (_role == CoopNetRole.Client)
+            {
+                if (_serverEndPoint == null || !remote.Equals(_serverEndPoint))
+                    return;
+            }
+            else
+                return;
+
+            ApplyRemoteMenuDisconnectFromPeer(remote.ToString() ?? "?");
+            return;
+        }
+
         byte op = data[4];
         if (op == CoopControlPacket.OpLobbySetReadyRequest && _role == CoopNetRole.Host)
         {
@@ -1196,6 +1563,47 @@ internal static class CoopUdpTransport
             return;
         }
 
+        if (op == CoopControlPacket.OpLobbyPlayerSlot && _role == CoopNetRole.Host)
+        {
+            if (!CoopControlPacket.TryReadLobbyPlayerSlot(
+                    data,
+                    length,
+                    out ulong sessionId,
+                    out _,
+                    out _,
+                    out byte slotIndex))
+                return;
+            if (LobbySession.SessionId != 0 && sessionId != LobbySession.SessionId)
+            {
+                LogLobbyStale("player-slot", sessionId, LobbySession.SessionId);
+                return;
+            }
+
+            EnsureHostPeerForOwnership(remote);
+            if (!LobbySession.HostApplyClientPlayerSlot(slotIndex))
+                return;
+            LobbySession.BuildSnapshot(
+                out ulong sid,
+                out uint rev,
+                out uint seq,
+                out uint readyMask,
+                out byte kind,
+                out uint missionToken,
+                out uint loadingFlags);
+            SendLobbySnapshotToPeer(remote, sid, rev, seq, readyMask, kind);
+            CoopNetSession.NotifyLobbySnapshotApplied(
+                sid,
+                rev,
+                seq,
+                readyMask,
+                kind,
+                missionToken,
+                loadingFlags,
+                isHost: true);
+            MelonLogger.Msg($"[CoopNet][M3] player-slot-applied sid={sid} rev={rev} slot={slotIndex} readyMask={readyMask}");
+            return;
+        }
+
         if (op == CoopControlPacket.OpLobbyStartRequest && _role == CoopNetRole.Host)
         {
             if (!CoopControlPacket.TryReadLobbyStartRequest(data, length, out ulong sessionId, out _))
@@ -1221,7 +1629,8 @@ internal static class CoopUdpTransport
                     out uint readyMask,
                     out byte kind))
                 return;
-            if (!LobbySession.ClientApplySnapshot(sid, rev, seq, readyMask, kind, CoopNetSession.CurrentMissionToken, 0u))
+            uint keepMissionToken = LobbySession.SelectedMissionToken;
+            if (!LobbySession.ClientApplySnapshot(sid, rev, seq, readyMask, kind, keepMissionToken, 0u))
             {
                 LogLobbyStale("snapshot", sid, LobbySession.SessionId);
                 return;
@@ -1233,10 +1642,41 @@ internal static class CoopUdpTransport
                 seq,
                 readyMask,
                 kind,
-                CoopNetSession.CurrentMissionToken,
+                keepMissionToken,
                 0u,
                 isHost: false);
+            ClientFlushLobbyOrderingAfterSnapshot(rev);
             MelonLogger.Msg($"[CoopNet][M3] snapshot-applied sid={sid} rev={rev} readyMask={readyMask}");
+            return;
+        }
+
+        if (op == CoopControlPacket.OpLobbyMissionBriefingKey && _role == CoopNetRole.Client)
+        {
+            if (!CoopControlPacket.TryReadLobbyMissionBriefingKey(
+                    data,
+                    length,
+                    out ulong sid,
+                    out uint rev,
+                    out _,
+                    out string briefingKey))
+                return;
+            ClientQueueOrApplyBriefingKey(sid, rev, briefingKey);
+            MelonLogger.Msg($"[CoopNet][Lobby] briefing-key sid={sid} rev={rev}");
+            return;
+        }
+
+        if (op == CoopControlPacket.OpLobbyFlexOverrides && _role == CoopNetRole.Client)
+        {
+            if (!CoopControlPacket.TryReadLobbyFlexOverrides(
+                    data,
+                    length,
+                    out ulong sid,
+                    out uint rev,
+                    out _,
+                    out byte[] flexPayload))
+                return;
+            ClientQueueOrApplyFlexPayload(sid, rev, flexPayload);
+            MelonLogger.Msg($"[CoopNet][Lobby] flex-overrides sid={sid} rev={rev} bytes={flexPayload.Length}");
             return;
         }
 
@@ -1357,24 +1797,8 @@ internal static class CoopUdpTransport
             CoopNetSession.HostRegisterPeer(remote, out byte assigned);
             SendWelcome(remote, assigned, nonce);
             ulong sid = LobbySession.EnsureHostSession();
-            LobbySession.BuildSnapshot(
-                out _,
-                out uint rev,
-                out uint seq,
-                out uint readyMask,
-                out byte kind,
-                out uint missionToken,
-                out uint loadingFlags);
-            SendLobbySnapshotToPeer(remote, sid, rev, seq, readyMask, kind);
-            CoopNetSession.NotifyLobbySnapshotApplied(
-                sid,
-                rev,
-                seq,
-                readyMask,
-                kind,
-                missionToken,
-                loadingFlags,
-                isHost: true);
+            LobbySession.HostSeedBriefingKeyIfUnset(CoopLobbyMissionSelection.LastSceneMapKey);
+            HostPushLobbyVisualStateToPeer(remote, sendBriefingKey: true, sendFlexBlob: true, notifyHostSnapshot: true);
             MelonLogger.Msg($"[CoopNet][M3] session-created sid={sid}");
             if (CoopSessionState.IsPlaying)
                 SendOwnerSync();

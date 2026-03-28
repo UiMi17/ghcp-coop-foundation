@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Reflection;
 using GHPC.CoopFoundation;
+using GHPC.CoopFoundation.Net;
 using GHPC.UI;
 using HarmonyLib;
 
@@ -14,6 +15,7 @@ internal static class PatchMissionBriefMenuCoopSelectionString
     private static void Postfix(string sceneMapKey)
     {
         CoopLobbyMissionSelection.RecordSceneMapKey(sceneMapKey);
+        CoopUdpTransport.NotifyHostLocalBriefingChangedIfNeeded(sceneMapKey);
     }
 }
 
@@ -45,7 +47,10 @@ internal static class PatchMissionBriefMenuCoopSelectionSceneKey
             string? tk = kt.GetProperty("TheaterKey")?.GetValue(sceneMissionKey) as string;
             string? mk = kt.GetProperty("MissionKey")?.GetValue(sceneMissionKey) as string;
             if (!string.IsNullOrEmpty(tk) && !string.IsNullOrEmpty(mk))
-                CoopLobbyMissionSelection.RecordSceneMapKey($"{tk},{mk}");
+            {
+                CoopLobbyMissionSelection.RecordSceneMapKeyFromParts(tk, mk);
+                CoopUdpTransport.NotifyHostLocalBriefingChangedIfNeeded(CoopLobbyMissionSelection.LastSceneMapKey);
+            }
         }
         catch
         {

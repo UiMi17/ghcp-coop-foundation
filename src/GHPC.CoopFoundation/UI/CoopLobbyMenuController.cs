@@ -1,4 +1,5 @@
 using System;
+using GHPC.CoopFoundation;
 using GHPC.CoopFoundation.Net;
 using TMPro;
 using UnityEngine;
@@ -104,7 +105,7 @@ internal sealed class CoopLobbyMenuController
         {
             if (!CoopUdpTransport.TryHostStartRequestFromMenu())
             {
-                _state.MarkError("Start request rejected (ready preconditions)");
+                _state.MarkError("Start request rejected (ready preconditions).");
             }
             else
             {
