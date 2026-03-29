@@ -2,8 +2,6 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Text;
-using GHPC.CoopFoundation;
-using GHPC.CoopFoundation.Net;
 using GHPC.Mission;
 using GHPC.Mission.Data;
 using GHPC.UI.Menu;

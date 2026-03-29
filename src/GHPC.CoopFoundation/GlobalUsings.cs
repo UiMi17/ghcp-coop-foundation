@@ -1,0 +1,12 @@
+global using GHPC.CoopFoundation.Bootstrap;
+global using GHPC.CoopFoundation.GameSession;
+global using GHPC.CoopFoundation.Lobby;
+global using GHPC.CoopFoundation.Planning;
+global using GHPC.CoopFoundation.Sampling;
+global using GHPC.CoopFoundation.Networking.Transport;
+global using GHPC.CoopFoundation.Networking.Protocol;
+global using GHPC.CoopFoundation.Networking.Session;
+global using GHPC.CoopFoundation.Networking.Host;
+global using GHPC.CoopFoundation.Networking.Client;
+global using GHPC.CoopFoundation.Networking.Replication;
+global using GHPC.CoopFoundation.Networking.Cosmetics;

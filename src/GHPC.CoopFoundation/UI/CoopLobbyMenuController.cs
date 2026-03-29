@@ -1,6 +1,4 @@
 using System;
-using GHPC.CoopFoundation;
-using GHPC.CoopFoundation.Net;
 using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
