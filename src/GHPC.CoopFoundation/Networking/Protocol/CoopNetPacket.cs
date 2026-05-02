@@ -17,6 +17,12 @@ internal readonly struct CoopSnapshotWire
     public readonly Quaternion GunWorldRotation;
     public readonly uint UnitNetId;
 
+    public readonly Vector3 WorldLinearVelocity;
+
+    public readonly Vector3 WorldAngularVelocity;
+
+    public readonly float BrakePresentation01;
+
     public CoopSnapshotWire(
         uint sequence,
         int instanceId,
@@ -27,7 +33,10 @@ internal readonly struct CoopSnapshotWire
         bool legacyV1,
         Quaternion turretWorldRotation,
         Quaternion gunWorldRotation,
-        uint unitNetId)
+        uint unitNetId,
+        Vector3 worldLinearVelocity = default,
+        Vector3 worldAngularVelocity = default,
+        float brakePresentation01 = 0f)
     {
         Sequence = sequence;
         InstanceId = instanceId;
@@ -39,11 +48,14 @@ internal readonly struct CoopSnapshotWire
         TurretWorldRotation = turretWorldRotation;
         GunWorldRotation = gunWorldRotation;
         UnitNetId = unitNetId;
+        WorldLinearVelocity = worldLinearVelocity;
+        WorldAngularVelocity = worldAngularVelocity;
+        BrakePresentation01 = brakePresentation01;
     }
 }
 
 /// <summary>
-///     Binary snapshot: v1 40 B; v2 48 B (+ mission); v3 84 B (+ turret/gun world rot + unitNetId).
+///     Binary snapshot: … v5 108 B (+ ang vel); v6 112 B (+ brake 0–1).
 /// </summary>
 internal static class CoopNetPacket
 {
@@ -53,6 +65,12 @@ internal static class CoopNetPacket
 
     public const int LengthV3 = 84;
 
+    public const int LengthV4 = 96;
+
+    public const int LengthV5 = 108;
+
+    public const int LengthV6 = 112;
+
     public const int MinIncomingLength = LengthV1;
 
     public const byte WireVersion1 = 1;
@@ -60,6 +78,12 @@ internal static class CoopNetPacket
     public const byte WireVersion2 = 2;
 
     public const byte WireVersion3 = 3;
+
+    public const byte WireVersion4 = 4;
+
+    public const byte WireVersion5 = 5;
+
+    public const byte WireVersion6 = 6;
 
     /// <summary>Phase byte when packet is v1 (skip mission coherence).</summary>
     public const byte LegacyPhaseMarker = 255;
@@ -113,6 +137,163 @@ internal static class CoopNetPacket
         WriteU32(buffer, o, unitNetId);
     }
 
+    public static void WriteV4(
+        byte[] buffer,
+        uint sequence,
+        int instanceId,
+        Vector3 position,
+        Quaternion hullRotation,
+        uint missionToken,
+        byte missionPhaseWire,
+        Quaternion turretWorld,
+        Quaternion gunWorld,
+        uint unitNetId,
+        Vector3 worldLinearVelocity)
+    {
+        if (buffer.Length < LengthV4)
+            throw new ArgumentException("buffer too small", nameof(buffer));
+        buffer[0] = Magic0;
+        buffer[1] = Magic1;
+        buffer[2] = Magic2;
+        buffer[3] = WireVersion4;
+        int o = 4;
+        o = WriteU32(buffer, o, sequence);
+        o = WriteI32(buffer, o, instanceId);
+        o = WriteF32(buffer, o, position.x);
+        o = WriteF32(buffer, o, position.y);
+        o = WriteF32(buffer, o, position.z);
+        o = WriteF32(buffer, o, hullRotation.x);
+        o = WriteF32(buffer, o, hullRotation.y);
+        o = WriteF32(buffer, o, hullRotation.z);
+        o = WriteF32(buffer, o, hullRotation.w);
+        o = WriteU32(buffer, o, missionToken);
+        buffer[o] = missionPhaseWire;
+        o++;
+        buffer[o++] = 0;
+        buffer[o++] = 0;
+        buffer[o++] = 0;
+        o = WriteF32(buffer, o, turretWorld.x);
+        o = WriteF32(buffer, o, turretWorld.y);
+        o = WriteF32(buffer, o, turretWorld.z);
+        o = WriteF32(buffer, o, turretWorld.w);
+        o = WriteF32(buffer, o, gunWorld.x);
+        o = WriteF32(buffer, o, gunWorld.y);
+        o = WriteF32(buffer, o, gunWorld.z);
+        o = WriteF32(buffer, o, gunWorld.w);
+        o = WriteU32(buffer, o, unitNetId);
+        o = WriteF32(buffer, o, worldLinearVelocity.x);
+        o = WriteF32(buffer, o, worldLinearVelocity.y);
+        _ = WriteF32(buffer, o, worldLinearVelocity.z);
+    }
+
+    public static void WriteV5(
+        byte[] buffer,
+        uint sequence,
+        int instanceId,
+        Vector3 position,
+        Quaternion hullRotation,
+        uint missionToken,
+        byte missionPhaseWire,
+        Quaternion turretWorld,
+        Quaternion gunWorld,
+        uint unitNetId,
+        Vector3 worldLinearVelocity,
+        Vector3 worldAngularVelocity)
+    {
+        if (buffer.Length < LengthV5)
+            throw new ArgumentException("buffer too small", nameof(buffer));
+        buffer[0] = Magic0;
+        buffer[1] = Magic1;
+        buffer[2] = Magic2;
+        buffer[3] = WireVersion5;
+        int o = 4;
+        o = WriteU32(buffer, o, sequence);
+        o = WriteI32(buffer, o, instanceId);
+        o = WriteF32(buffer, o, position.x);
+        o = WriteF32(buffer, o, position.y);
+        o = WriteF32(buffer, o, position.z);
+        o = WriteF32(buffer, o, hullRotation.x);
+        o = WriteF32(buffer, o, hullRotation.y);
+        o = WriteF32(buffer, o, hullRotation.z);
+        o = WriteF32(buffer, o, hullRotation.w);
+        o = WriteU32(buffer, o, missionToken);
+        buffer[o] = missionPhaseWire;
+        o++;
+        buffer[o++] = 0;
+        buffer[o++] = 0;
+        buffer[o++] = 0;
+        o = WriteF32(buffer, o, turretWorld.x);
+        o = WriteF32(buffer, o, turretWorld.y);
+        o = WriteF32(buffer, o, turretWorld.z);
+        o = WriteF32(buffer, o, turretWorld.w);
+        o = WriteF32(buffer, o, gunWorld.x);
+        o = WriteF32(buffer, o, gunWorld.y);
+        o = WriteF32(buffer, o, gunWorld.z);
+        o = WriteF32(buffer, o, gunWorld.w);
+        o = WriteU32(buffer, o, unitNetId);
+        o = WriteF32(buffer, o, worldLinearVelocity.x);
+        o = WriteF32(buffer, o, worldLinearVelocity.y);
+        o = WriteF32(buffer, o, worldLinearVelocity.z);
+        o = WriteF32(buffer, o, worldAngularVelocity.x);
+        o = WriteF32(buffer, o, worldAngularVelocity.y);
+        _ = WriteF32(buffer, o, worldAngularVelocity.z);
+    }
+
+    public static void WriteV6(
+        byte[] buffer,
+        uint sequence,
+        int instanceId,
+        Vector3 position,
+        Quaternion hullRotation,
+        uint missionToken,
+        byte missionPhaseWire,
+        Quaternion turretWorld,
+        Quaternion gunWorld,
+        uint unitNetId,
+        Vector3 worldLinearVelocity,
+        Vector3 worldAngularVelocity,
+        float brakePresentation01)
+    {
+        if (buffer.Length < LengthV6)
+            throw new ArgumentException("buffer too small", nameof(buffer));
+        buffer[0] = Magic0;
+        buffer[1] = Magic1;
+        buffer[2] = Magic2;
+        buffer[3] = WireVersion6;
+        int o = 4;
+        o = WriteU32(buffer, o, sequence);
+        o = WriteI32(buffer, o, instanceId);
+        o = WriteF32(buffer, o, position.x);
+        o = WriteF32(buffer, o, position.y);
+        o = WriteF32(buffer, o, position.z);
+        o = WriteF32(buffer, o, hullRotation.x);
+        o = WriteF32(buffer, o, hullRotation.y);
+        o = WriteF32(buffer, o, hullRotation.z);
+        o = WriteF32(buffer, o, hullRotation.w);
+        o = WriteU32(buffer, o, missionToken);
+        buffer[o] = missionPhaseWire;
+        o++;
+        buffer[o++] = 0;
+        buffer[o++] = 0;
+        buffer[o++] = 0;
+        o = WriteF32(buffer, o, turretWorld.x);
+        o = WriteF32(buffer, o, turretWorld.y);
+        o = WriteF32(buffer, o, turretWorld.z);
+        o = WriteF32(buffer, o, turretWorld.w);
+        o = WriteF32(buffer, o, gunWorld.x);
+        o = WriteF32(buffer, o, gunWorld.y);
+        o = WriteF32(buffer, o, gunWorld.z);
+        o = WriteF32(buffer, o, gunWorld.w);
+        o = WriteU32(buffer, o, unitNetId);
+        o = WriteF32(buffer, o, worldLinearVelocity.x);
+        o = WriteF32(buffer, o, worldLinearVelocity.y);
+        o = WriteF32(buffer, o, worldLinearVelocity.z);
+        o = WriteF32(buffer, o, worldAngularVelocity.x);
+        o = WriteF32(buffer, o, worldAngularVelocity.y);
+        o = WriteF32(buffer, o, worldAngularVelocity.z);
+        _ = WriteF32(buffer, o, brakePresentation01);
+    }
+
     public static bool TryRead(byte[] data, int length, out CoopSnapshotWire wire)
     {
         wire = default;
@@ -141,7 +322,10 @@ internal static class CoopNetPacket
                 legacyV1: true,
                 hull,
                 hull,
-                0);
+                0,
+                default,
+                default,
+                0f);
             return true;
         }
 
@@ -167,7 +351,10 @@ internal static class CoopNetPacket
                 legacyV1: false,
                 hull,
                 hull,
-                0);
+                0,
+                default,
+                default,
+                0f);
             return true;
         }
 
@@ -199,7 +386,136 @@ internal static class CoopNetPacket
                 legacyV1: false,
                 turret,
                 gun,
-                netId);
+                netId,
+                default,
+                default,
+                0f);
+            return true;
+        }
+
+        if (ver == WireVersion4 && length >= LengthV4)
+        {
+            int o = 4;
+            uint seq = ReadU32(data, ref o);
+            int id = ReadI32(data, ref o);
+            float px = ReadF32(data, ref o);
+            float py = ReadF32(data, ref o);
+            float pz = ReadF32(data, ref o);
+            Quaternion hull = ReadQuat(data, ref o);
+            hull.Normalize();
+            uint token = ReadU32(data, ref o);
+            byte phase = data[o];
+            o += 4;
+            Quaternion turret = ReadQuat(data, ref o);
+            turret.Normalize();
+            Quaternion gun = ReadQuat(data, ref o);
+            gun.Normalize();
+            uint netId = ReadU32(data, ref o);
+            float vx = ReadF32(data, ref o);
+            float vy = ReadF32(data, ref o);
+            float vz = ReadF32(data, ref o);
+            var wv = new Vector3(vx, vy, vz);
+            wire = new CoopSnapshotWire(
+                seq,
+                id,
+                new Vector3(px, py, pz),
+                hull,
+                token,
+                phase,
+                legacyV1: false,
+                turret,
+                gun,
+                netId,
+                wv,
+                default,
+                0f);
+            return true;
+        }
+
+        if (ver == WireVersion5 && length >= LengthV5)
+        {
+            int o = 4;
+            uint seq = ReadU32(data, ref o);
+            int id = ReadI32(data, ref o);
+            float px = ReadF32(data, ref o);
+            float py = ReadF32(data, ref o);
+            float pz = ReadF32(data, ref o);
+            Quaternion hull = ReadQuat(data, ref o);
+            hull.Normalize();
+            uint token = ReadU32(data, ref o);
+            byte phase = data[o];
+            o += 4;
+            Quaternion turret = ReadQuat(data, ref o);
+            turret.Normalize();
+            Quaternion gun = ReadQuat(data, ref o);
+            gun.Normalize();
+            uint netId = ReadU32(data, ref o);
+            float vx = ReadF32(data, ref o);
+            float vy = ReadF32(data, ref o);
+            float vz = ReadF32(data, ref o);
+            var wv = new Vector3(vx, vy, vz);
+            float ax = ReadF32(data, ref o);
+            float ay = ReadF32(data, ref o);
+            float az = ReadF32(data, ref o);
+            var wa = new Vector3(ax, ay, az);
+            wire = new CoopSnapshotWire(
+                seq,
+                id,
+                new Vector3(px, py, pz),
+                hull,
+                token,
+                phase,
+                legacyV1: false,
+                turret,
+                gun,
+                netId,
+                wv,
+                wa,
+                0f);
+            return true;
+        }
+
+        if (ver == WireVersion6 && length >= LengthV6)
+        {
+            int o = 4;
+            uint seq = ReadU32(data, ref o);
+            int id = ReadI32(data, ref o);
+            float px = ReadF32(data, ref o);
+            float py = ReadF32(data, ref o);
+            float pz = ReadF32(data, ref o);
+            Quaternion hull = ReadQuat(data, ref o);
+            hull.Normalize();
+            uint token = ReadU32(data, ref o);
+            byte phase = data[o];
+            o += 4;
+            Quaternion turret = ReadQuat(data, ref o);
+            turret.Normalize();
+            Quaternion gun = ReadQuat(data, ref o);
+            gun.Normalize();
+            uint netId = ReadU32(data, ref o);
+            float vx = ReadF32(data, ref o);
+            float vy = ReadF32(data, ref o);
+            float vz = ReadF32(data, ref o);
+            var wv = new Vector3(vx, vy, vz);
+            float ax = ReadF32(data, ref o);
+            float ay = ReadF32(data, ref o);
+            float az = ReadF32(data, ref o);
+            var wa = new Vector3(ax, ay, az);
+            float br = ReadF32(data, ref o);
+            wire = new CoopSnapshotWire(
+                seq,
+                id,
+                new Vector3(px, py, pz),
+                hull,
+                token,
+                phase,
+                legacyV1: false,
+                turret,
+                gun,
+                netId,
+                wv,
+                wa,
+                br);
             return true;
         }
 

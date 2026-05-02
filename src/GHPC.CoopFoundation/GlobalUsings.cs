@@ -1,4 +1,5 @@
 global using GHPC.CoopFoundation.Bootstrap;
+global using GHPC.CoopFoundation.Networking;
 global using GHPC.CoopFoundation.GameSession;
 global using GHPC.CoopFoundation.Lobby;
 global using GHPC.CoopFoundation.Planning;

@@ -1,19 +1,18 @@
 using System.Collections.Generic;
 using GHPC;
 using GHPC.AI;
-using GHPC.CoopFoundation.Networking;
 using GHPC.Player;
 using MelonLoader;
 using UnityEngine;
 
-namespace GHPC.CoopFoundation.Networking.Host;
+namespace GHPC.CoopFoundation.Networking.Client;
 
 /// <summary>
-///     Host-only: drive the real client <see cref="Unit" /> from <see cref="CoopRemoteState" /> so host simulation
-///     (physics, LOS, <see cref="Unit.NotifyStruck" />) matches the remote player. Disables vanilla AI / driver
-///     controllers that would fight network transforms.
+///     Client-only: drive the remote host's <see cref="Unit" /> hull and aim from <see cref="CoopRemoteState" /> (GHP),
+///     symmetric to <see cref="GHPC.CoopFoundation.Networking.Host.HostPeerUnitPuppet" /> on the host. Excludes that netId from the GHW governor buffer
+///     so low-rate world snapshots do not fight high-rate peer snapshots.
 /// </summary>
-internal static class HostPeerUnitPuppet
+internal static class ClientPeerUnitPuppet
 {
     private static readonly List<(Behaviour behaviour, bool wasEnabled)> DisabledBehaviours = new();
 
@@ -27,7 +26,6 @@ internal static class HostPeerUnitPuppet
 
     private static CoopVanillaVehicleDriverMute? _driverMute;
 
-    /// <summary>Damped follow for hull pose (GHP ~10 Hz); hard snaps make stowage/backpacks stutter.</summary>
     private static Vector3 _hullFollowPosVel;
 
     public static bool Enabled { get; set; } = true;
@@ -50,10 +48,10 @@ internal static class HostPeerUnitPuppet
         return unit != null && netId != 0;
     }
 
-    /// <summary>Call from <see cref="UnityEngine.MonoBehaviour.FixedUpdate" /> pipeline (physics).</summary>
+    /// <summary>Call from <see cref="UnityEngine.MonoBehaviour.FixedUpdate" /> (physics).</summary>
     public static void TickFixedUpdate()
     {
-        if (!Enabled || !CoopUdpTransport.IsHost || !CoopSessionState.IsPlaying || !CoopUdpTransport.HostHasLobbyPeer)
+        if (!Enabled || !CoopUdpTransport.IsClient || !CoopUdpTransport.IsNetworkActive || !CoopSessionState.IsPlaying)
         {
             if (_activeUnit != null)
                 RestoreAll();
@@ -72,11 +70,9 @@ internal static class HostPeerUnitPuppet
         {
             if (_activeUnit != null)
                 RestoreAll();
-            CoopReplicationDiagnostics.LogHostPeerUnitNotFound(CoopRemoteState.RemoteUnitNetId);
+            CoopReplicationDiagnostics.LogClientPeerUnitNotFound(CoopRemoteState.RemoteUnitNetId);
             return;
         }
-
-        // Do not compare Unity instance ids across processes — client snapshot ids are local to the client machine.
 
         if (!ShouldPuppetUnit(unit, CoopRemoteState.RemoteUnitNetId))
         {
@@ -121,7 +117,7 @@ internal static class HostPeerUnitPuppet
     /// <summary>Call from LateUpdate so aim overrides run after physics.</summary>
     public static void TickLateUpdate()
     {
-        if (!Enabled || !CoopUdpTransport.IsHost || !CoopSessionState.IsPlaying || !CoopUdpTransport.HostHasLobbyPeer)
+        if (!Enabled || !CoopUdpTransport.IsClient || !CoopUdpTransport.IsNetworkActive || !CoopSessionState.IsPlaying)
             return;
         if (!CoopRemoteState.HasData || CoopRemoteState.RemoteUnitNetId == 0)
             return;
@@ -141,7 +137,7 @@ internal static class HostPeerUnitPuppet
             if (Log && !_loggedSkip)
             {
                 _loggedSkip = true;
-                MelonLogger.Msg("[CoopHostPuppet] Skipping: remote snapshot targets host CurrentPlayerUnit (unexpected).");
+                MelonLogger.Msg("[CoopClientPuppet] Skipping: remote snapshot targets client CurrentPlayerUnit (unexpected).");
             }
 
             return false;
@@ -193,7 +189,7 @@ internal static class HostPeerUnitPuppet
 
         CoopVanillaVehicleDriverMute.TryBegin(unit, out _driverMute);
         if (Log && _driverMute == null)
-            MelonLogger.Msg("[CoopHostPuppet] No NWH drivers muted (unusual for tracked vehicle).");
+            MelonLogger.Msg("[CoopClientPuppet] No NWH drivers muted (unusual for tracked vehicle).");
 
         if (!CoopAimableSampler.TryGetTraverseAndGun(unit, out AimablePlatform? traverse, out AimablePlatform? gun))
             return;
@@ -211,7 +207,7 @@ internal static class HostPeerUnitPuppet
         }
 
         if (Log)
-            MelonLogger.Msg($"[CoopHostPuppet] Puppeting netId={netId} unit=\"{unit.UniqueName}\".");
+            MelonLogger.Msg($"[CoopClientPuppet] Puppeting netId={netId} unit=\"{unit.UniqueName}\".");
     }
 
     private static void ApplyAim(Unit unit, Quaternion turretWorld, Quaternion gunWorld)

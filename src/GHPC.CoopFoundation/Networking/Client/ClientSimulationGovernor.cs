@@ -1,11 +1,13 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using GHPC.Crew;
 using GHPC;
-using GHPC.Weapons;
+using GHPC.CoopFoundation.Networking;
+using GHPC.CoopFoundation.Networking.NwhPuppet;
 using MelonLoader;
+using NWH.VehiclePhysics;
 using UnityEngine;
-using System.Linq;
 
 namespace GHPC.CoopFoundation.Networking.Client;
 
@@ -38,6 +40,18 @@ internal static class ClientSimulationGovernor
 
         public readonly Quaternion GunWorldRotation;
 
+        public readonly Vector3 WorldLinearVelocity;
+
+        public readonly Vector3 WorldAngularVelocity;
+
+        public readonly float BrakePresentation01;
+
+        /// <summary>GHW v5 linear acceleration (m/s²); zero for v4 snapshots.</summary>
+        public readonly Vector3 WorldLinearAcceleration;
+
+        /// <summary>GHW v6: NWH motor axis (−1…1); zero if peer sends v5 or lower.</summary>
+        public readonly float MotorInputVertical;
+
         public readonly float SampleTime;
 
         public SnapshotState(
@@ -45,12 +59,22 @@ internal static class ClientSimulationGovernor
             Quaternion hullRotation,
             Quaternion turretWorldRotation,
             Quaternion gunWorldRotation,
+            Vector3 worldLinearVelocity,
+            Vector3 worldAngularVelocity,
+            float brakePresentation01,
+            Vector3 worldLinearAcceleration,
+            float motorInputVertical,
             float sampleTime)
         {
             Position = position;
             HullRotation = hullRotation;
             TurretWorldRotation = turretWorldRotation;
             GunWorldRotation = gunWorldRotation;
+            WorldLinearVelocity = worldLinearVelocity;
+            WorldAngularVelocity = worldAngularVelocity;
+            BrakePresentation01 = brakePresentation01;
+            WorldLinearAcceleration = worldLinearAcceleration;
+            MotorInputVertical = motorInputVertical;
             SampleTime = sampleTime;
         }
     }
@@ -95,6 +119,20 @@ internal static class ClientSimulationGovernor
     private static readonly Dictionary<uint, Vector3> PositionVelByNetId = new();
     private static readonly Dictionary<uint, Vector3> NetVelocityByNetId = new();
     private static readonly Dictionary<uint, List<(Behaviour Behaviour, bool WasEnabled)>> SuppressedDriversByNetId = new();
+
+    private static readonly Dictionary<uint, List<(VehicleController Vc, bool WasRiggingEnabled)>> SuppressedRiggingByNetId = new();
+
+    /// <summary>Latest GHW world linear velocity per netId (for track / wheel presentation).</summary>
+    private static readonly Dictionary<uint, Vector3> WireLinearVelocityByNetId = new();
+
+    /// <summary>Latest GHW world angular velocity (rad/s) when buffer has not enough samples yet.</summary>
+    private static readonly Dictionary<uint, Vector3> WireAngularVelocityByNetId = new();
+
+    private static readonly Dictionary<uint, Vector3> WireLinearAccelerationByNetId = new();
+
+    private static readonly Dictionary<uint, float> WireBrakePresentationByNetId = new();
+
+    private static readonly Dictionary<uint, float> WireMotorVerticalByNetId = new();
     private static readonly Dictionary<uint, Rigidbody?> RigidBodyByNetId = new();
     private static readonly Dictionary<uint, (bool IsKinematic, RigidbodyInterpolation Interpolation)> SuppressedRigidbodyStateByNetId = new();
     private static readonly Dictionary<uint, (Vector3 Pos, Quaternion Rot, bool HardSnap)> PendingPhysicsApplyByNetId = new();
@@ -107,6 +145,13 @@ internal static class ClientSimulationGovernor
     private static bool _softSuppressEnabled;
     private static bool _log;
     private static bool _safeMode = true;
+    private static bool _lodEnabled = true;
+    private static float _lodNearMeters = 220f;
+    private static float _lodMidMeters = 550f;
+    private static int _lodMidAimEveryFrames = 2;
+    private static int _lodFarHullEveryFrames = 2;
+    private static int _lodFarAimEveryFrames = 6;
+    private static int _correctionBudgetMax = 72;
     private static bool _degradedToCorrectionOff;
     private static bool _degradedToSuppressOff;
     private static SuppressDegradeReason _suppressDegradeReason;
@@ -164,16 +209,107 @@ internal static class ClientSimulationGovernor
     private const float SuppressRecoveryCooldownSeconds = 8f;
     private const float ExtrapolationClampSeconds = 0.08f;
     private const float MinInterpolationBackTimeSeconds = 0.14f;
+
+    /// <summary>GHW sample pairs with smaller displacement are treated as stationary (reduces bogus netVel / extrapolation jitter).</summary>
+    private const float IdleDisplacementEpsilonMeters = 0.006f;
+
+    /// <summary>Do not extrapolate buffered pose when estimated speed is below this (avoids cm rocking when idle).</summary>
+    private const float ExtrapolationMinSpeedMetersPerSec = 0.22f;
+
+    /// <summary>
+    ///     Hermite position derivative includes (p1−p0) terms even when endpoint wire v≈0, so micro RB jitter on the
+    ///     host produces bogus non-zero display velocity (slow track UV crawl). Above this chord we keep Hermite v.
+    /// </summary>
+    private const float TrackedIdleChordForWireVelocityBlendMeters = 0.045f;
+
+    /// <summary>When both GHW endpoint speeds are below this, prefer wire velocity lerp over Hermite dPdu/dt near idle.</summary>
+    private const float TrackedIdleWireSpeedMaxMetersPerSec = 0.55f;
     private const float MaxInterpolationBackTimeSeconds = 0.38f;
     private const float InterpolationBackTimeBaseSeconds = 0.12f;
 
-    public static void Configure(bool enabled, float strength, bool softSuppressEnabled, bool log, bool safeMode)
+    public static void Configure(
+        bool enabled,
+        float strength,
+        bool softSuppressEnabled,
+        bool log,
+        bool safeMode,
+        bool lodEnabled,
+        float lodNearMeters,
+        float lodMidMeters,
+        int lodMidAimEveryFrames,
+        int lodFarHullEveryFrames,
+        int lodFarAimEveryFrames,
+        int correctionBudgetMax)
     {
         _enabled = enabled;
         _strength = strength < 0f ? 0f : strength;
         _softSuppressEnabled = softSuppressEnabled;
         _log = log;
         _safeMode = safeMode;
+        _lodEnabled = lodEnabled;
+        _lodNearMeters = Mathf.Max(30f, lodNearMeters);
+        _lodMidMeters = Mathf.Max(_lodNearMeters + 25f, lodMidMeters);
+        _lodMidAimEveryFrames = Mathf.Clamp(lodMidAimEveryFrames, 1, 12);
+        _lodFarHullEveryFrames = Mathf.Clamp(lodFarHullEveryFrames, 1, 8);
+        _lodFarAimEveryFrames = Mathf.Clamp(lodFarAimEveryFrames, 0, 24);
+        _correctionBudgetMax = Mathf.Clamp(correctionBudgetMax, 24, 128);
+    }
+
+    private static int LodMix(uint netId) => (int)(netId * 2654435761u);
+
+    private static bool LodStrideHit(uint netId, int stride, int salt)
+    {
+        if (stride <= 1)
+            return true;
+        int mix = LodMix(netId) + salt;
+        return ((Time.frameCount + mix) % stride + stride) % stride == 0;
+    }
+
+    private static int GetLodTier(uint netId, in Vector3 unitWorldPos)
+    {
+        if (!_lodEnabled)
+            return 0;
+        if (CoopRemoteState.HasData && netId == CoopRemoteState.RemoteUnitNetId)
+            return 0;
+        float d = MinDistanceToClientReferences(in unitWorldPos);
+        if (d <= _lodNearMeters)
+            return 0;
+        if (d <= _lodMidMeters)
+            return 1;
+        return 2;
+    }
+
+    private static bool ShouldRunGovernorLodAim(int tier, uint netId)
+    {
+        if (!_lodEnabled)
+            return true;
+        if (tier <= 0)
+            return true;
+        if (tier == 1)
+            return LodStrideHit(netId, _lodMidAimEveryFrames, 3);
+        if (_lodFarAimEveryFrames <= 0)
+            return false;
+        return LodStrideHit(netId, _lodFarAimEveryFrames, 11);
+    }
+
+    private static bool ShouldRunGovernorLodHull(int tier, uint netId)
+    {
+        if (!_lodEnabled)
+            return true;
+        if (tier < 2)
+            return true;
+        return LodStrideHit(netId, _lodFarHullEveryFrames, 0);
+    }
+
+    /// <summary>Far LOD tier: skip work on some frames (salt separates Late vs Fixed cadence).</summary>
+    internal static bool ShouldThrottleLodFarTierWork(uint netId, in Vector3 unitWorldPos, int salt)
+    {
+        if (!_lodEnabled)
+            return false;
+        if (GetLodTier(netId, in unitWorldPos) < 2)
+            return false;
+        int stride = Mathf.Max(2, _lodFarHullEveryFrames);
+        return !LodStrideHit(netId, stride, salt);
     }
 
     public static void ResetSession()
@@ -185,8 +321,6 @@ internal static class ClientSimulationGovernor
         NetVelocityByNetId.Clear();
         RigidBodyByNetId.Clear();
         PendingPhysicsApplyByNetId.Clear();
-        SuppressedDriversByNetId.Clear();
-        SuppressedRigidbodyStateByNetId.Clear();
         HeavyCorrectionHitsByNetId.Clear();
         MotionProfileByNetId.Clear();
         UnitTimingByNetId.Clear();
@@ -194,6 +328,18 @@ internal static class ClientSimulationGovernor
         RestoreAllAimLoopsBestEffort();
         AimBindingByNetId.Clear();
         RestoreAllSuppressedUnitsBestEffort();
+        CoopRemotePuppetPresentationCache.ClearSession();
+        CoopPuppetWheelRegistry.ClearSession();
+        SuppressedDriversByNetId.Clear();
+        foreach (KeyValuePair<uint, List<(VehicleController Vc, bool WasRiggingEnabled)>> kv in SuppressedRiggingByNetId)
+            CoopNwhRiggingSuppress.Restore(kv.Value);
+        SuppressedRiggingByNetId.Clear();
+        WireLinearVelocityByNetId.Clear();
+        WireAngularVelocityByNetId.Clear();
+        WireLinearAccelerationByNetId.Clear();
+        WireBrakePresentationByNetId.Clear();
+        WireMotorVerticalByNetId.Clear();
+        SuppressedRigidbodyStateByNetId.Clear();
         SuppressedByNetId.Clear();
         _degradedToCorrectionOff = false;
         _degradedToSuppressOff = false;
@@ -238,6 +384,7 @@ internal static class ClientSimulationGovernor
         _overwriteRiskCount = 0;
         _physicsApplyCount = 0;
         _transformApplyCount = 0;
+        CoopPlayerScenarioDiagnostics.NotifySessionReset();
     }
 
     public static void OnMergedWorldSnapshot(List<WorldEntityWire> entities)
@@ -270,13 +417,26 @@ internal static class ClientSimulationGovernor
             WorldEntityWire e = entities[i];
             if (e.NetId == 0)
                 continue;
+            // Observer client: lobby peer hull is driven from GHP (ClientPeerUnitPuppet), not GHW interpolation.
+            if (IsClientRemotePeerHullGhpOnly(e.NetId))
+                continue;
             SeenInFrame.Add(e.NetId);
+            WireLinearVelocityByNetId[e.NetId] = e.WorldLinearVelocity;
+            WireAngularVelocityByNetId[e.NetId] = e.WorldAngularVelocity;
+            WireLinearAccelerationByNetId[e.NetId] = e.WorldLinearAcceleration;
             SnapshotState snap = new(
                 e.Position,
                 e.HullRotation,
                 e.TurretWorldRotation,
                 e.GunWorldRotation,
+                e.WorldLinearVelocity,
+                e.WorldAngularVelocity,
+                e.BrakePresentation01,
+                e.WorldLinearAcceleration,
+                e.MotorInputVertical,
                 now);
+            WireBrakePresentationByNetId[e.NetId] = e.BrakePresentation01;
+            WireMotorVerticalByNetId[e.NetId] = e.MotorInputVertical;
             if (!BufferedByNetId.TryGetValue(e.NetId, out BufferedState buffered))
                 buffered = default;
             if (buffered.HasNewer)
@@ -285,9 +445,12 @@ internal static class ClientSimulationGovernor
                 float dt = now - prev.SampleTime;
                 if (dt > 1e-4f && dt < 1.5f)
                 {
-                    Vector3 rawVel = (snap.Position - prev.Position) / dt;
+                    Vector3 deltaPos = snap.Position - prev.Position;
+                    float idleEpsSq = IdleDisplacementEpsilonMeters * IdleDisplacementEpsilonMeters;
+                    Vector3 rawVel = deltaPos.sqrMagnitude < idleEpsSq ? Vector3.zero : deltaPos / dt;
                     Vector3 oldVel = NetVelocityByNetId.TryGetValue(e.NetId, out Vector3 v) ? v : Vector3.zero;
-                    NetVelocityByNetId[e.NetId] = Vector3.Lerp(oldVel, rawVel, 0.35f);
+                    float blend = rawVel.sqrMagnitude < 1e-12f ? 0.45f : 0.35f;
+                    NetVelocityByNetId[e.NetId] = Vector3.Lerp(oldVel, rawVel, blend);
                     if (UnitTimingByNetId.TryGetValue(e.NetId, out var timing))
                     {
                         float dtEwma = timing.DtEwma <= 1e-4f ? dt : Mathf.Lerp(timing.DtEwma, dt, 0.2f);
@@ -327,10 +490,18 @@ internal static class ClientSimulationGovernor
             RigidBodyByNetId.Remove(stale[i]);
             PendingPhysicsApplyByNetId.Remove(stale[i]);
             SuppressedDriversByNetId.Remove(stale[i]);
+            SuppressedRiggingByNetId.Remove(stale[i]);
+            WireLinearVelocityByNetId.Remove(stale[i]);
+            WireAngularVelocityByNetId.Remove(stale[i]);
+            WireLinearAccelerationByNetId.Remove(stale[i]);
+            WireBrakePresentationByNetId.Remove(stale[i]);
+            WireMotorVerticalByNetId.Remove(stale[i]);
             HeavyCorrectionHitsByNetId.Remove(stale[i]);
             MotionProfileByNetId.Remove(stale[i]);
             UnitTimingByNetId.Remove(stale[i]);
             SuppressedRigidbodyStateByNetId.Remove(stale[i]);
+            CoopRemotePuppetPresentationCache.Remove(stale[i]);
+            CoopPuppetWheelRegistry.UnregisterNetId(stale[i]);
         }
     }
 
@@ -358,6 +529,24 @@ internal static class ClientSimulationGovernor
             return;
         if (!CoopUdpTransport.IsNetworkActive)
             return;
+
+        // Host never merges GHW into this buffer (only the client does); skip the heavy per-entity loop entirely.
+        if (CoopUdpTransport.IsHost && BufferedByNetId.Count == 0)
+            return;
+
+        // GHP-only peer hull: keep puppet suppress + wheel registry even when that netId is absent from the GHW buffer.
+        if (CoopUdpTransport.IsClient && _softSuppressEnabled && !_degradedToSuppressOff && CoopRemoteState.HasData
+            && CoopRemoteState.RemoteUnitNetId != 0)
+        {
+            uint rid = CoopRemoteState.RemoteUnitNetId;
+            if (!IsGovernorSkippedAsLocalOwned(rid))
+            {
+                Unit? ru = CoopUnitLookup.TryFindByNetId(rid);
+                if (ru != null)
+                    EnsureSuppressed(ru, rid);
+            }
+        }
+
         if (BufferedByNetId.Count == 0)
             return;
 
@@ -372,7 +561,7 @@ internal static class ClientSimulationGovernor
         float correctionDistSq = CorrectDistanceThresholdMeters * CorrectDistanceThresholdMeters;
         float lerpT = Mathf.Clamp01(deltaTime * Mathf.Max(0f, _strength) * 10f);
         float smoothTime = Mathf.Clamp(0.12f / Mathf.Max(0.25f, _strength), 0.05f, 0.22f);
-        int correctionBudgetPerFrame = Mathf.Clamp(16 + BufferedByNetId.Count / 3, 16, 56);
+        int correctionBudgetPerFrame = Mathf.Clamp(16 + BufferedByNetId.Count / 3, 16, _correctionBudgetMax);
         float posErrSum = 0f;
         float posErrMax = 0f;
         float rotErrSum = 0f;
@@ -398,13 +587,17 @@ internal static class ClientSimulationGovernor
                 }
                 Unit? unit = CoopUnitLookup.TryFindByNetId(netId);
                 if (unit == null)
+                {
+                    CoopReplicationDiagnostics.LogGovernorUnitNotFound(netId);
                     continue;
+                }
+
                 if (_softSuppressEnabled && !_degradedToSuppressOff)
                 {
                     EnsureSuppressed(unit, netId);
                 }
 
-                if (!TrySampleBuffered(kv.Value, renderTime, out SnapshotState targetState))
+                if (!TrySampleBuffered(netId, unit, kv.Value, renderTime, out SnapshotState targetState))
                 {
                     _bufferMissCount++;
                     continue;
@@ -412,6 +605,18 @@ internal static class ClientSimulationGovernor
                 _interpSampleCount++;
                 if (kv.Value.HasNewer && renderTime >= kv.Value.Newer.SampleTime)
                     _interpUnderrunCount++;
+
+                int lodTier = GetLodTier(netId, unit.transform.position);
+                bool runAim = ShouldRunGovernorLodAim(lodTier, netId);
+                bool runHull = ShouldRunGovernorLodHull(lodTier, netId);
+                if (!runAim && !runHull)
+                    continue;
+
+                if (runAim)
+                    TryApplyAimables(netId, unit, targetState.TurretWorldRotation, targetState.GunWorldRotation, lerpT);
+
+                if (!runHull)
+                    continue;
 
                 Transform t = unit.transform;
                 MotionProfile profile = ResolveMotionProfile(netId, unit);
@@ -426,15 +631,20 @@ internal static class ClientSimulationGovernor
                 Vector3 targetPos = targetState.Position;
                 float unitBackTime = GetPerUnitInterpolationBackTime(netId);
                 float jitterWeight = Mathf.Clamp01((unitBackTime - MinInterpolationBackTimeSeconds) / 0.24f);
-                if (NetVelocityByNetId.TryGetValue(netId, out Vector3 netVel))
+                Vector3 extrapVel = profile == MotionProfile.Tracked
+                    ? targetState.WorldLinearVelocity
+                    : NetVelocityByNetId.TryGetValue(netId, out Vector3 nv) ? nv : Vector3.zero;
+                float speed = extrapVel.magnitude;
+                if (speed >= ExtrapolationMinSpeedMetersPerSec)
                 {
-                    float speed = netVel.magnitude;
                     float extrapolation = speed > 6f ? 0.022f : speed > 2.5f ? 0.035f : 0.052f;
                     if (profile == MotionProfile.Wheeled)
                         extrapolation *= 0.75f;
+                    if (profile == MotionProfile.Tracked)
+                        extrapolation *= 0.82f;
                     extrapolation = Mathf.Lerp(extrapolation, extrapolation * 0.6f, jitterWeight);
                     extrapolation = Mathf.Min(extrapolation, ExtrapolationClampSeconds);
-                    Vector3 offset = netVel * extrapolation;
+                    Vector3 offset = extrapVel * extrapolation;
                     if (offset.sqrMagnitude > 0.09f)
                         offset = offset.normalized * 0.3f;
                     targetPos += offset;
@@ -454,14 +664,15 @@ internal static class ClientSimulationGovernor
                     rotErrMax = rotErr;
                 sampleCount++;
 
-                // Aim sync must be independent from hull correction decision; otherwise turret/gun can freeze
-                // whenever hull drift is below threshold.
-                TryApplyAimables(netId, unit, targetState.TurretWorldRotation, targetState.GunWorldRotation, lerpT);
-
-                float speedForDeadband = NetVelocityByNetId.TryGetValue(netId, out Vector3 sv) ? sv.magnitude : 0f;
+                float speedForDeadband = profile == MotionProfile.Tracked
+                    ? targetState.WorldLinearVelocity.magnitude
+                    : NetVelocityByNetId.TryGetValue(netId, out Vector3 sv) ? sv.magnitude : 0f;
+                bool puppetVisual = SuppressedByNetId.TryGetValue(netId, out bool sup) && sup;
                 float profileDeadband = profile == MotionProfile.Wheeled ? 0.22f : profile == MotionProfile.Tracked ? 0.13f : 0.16f;
                 profileDeadband += Mathf.Clamp(speedForDeadband * 0.01f, 0f, 0.08f);
                 float correctionDistSqAdaptive = Mathf.Max(correctionDistSq, profileDeadband * profileDeadband);
+                if (puppetVisual && speedForDeadband < 4.5f)
+                    correctionDistSqAdaptive *= 1.22f;
                 bool needCorrect = posErrSq >= correctionDistSqAdaptive || rotErr >= CorrectAngleThresholdDegrees;
                 if (!needCorrect)
                 {
@@ -504,7 +715,23 @@ internal static class ClientSimulationGovernor
                         : profile == MotionProfile.Tracked
                             ? smoothTime * 0.92f
                             : smoothTime;
-                    profileSmoothTime = Mathf.Clamp(profileSmoothTime + jitterWeight * 0.04f, 0.05f, 0.30f);
+                    if (profile == MotionProfile.Tracked)
+                    {
+                        float b = targetState.BrakePresentation01;
+                        profileSmoothTime *= 1f + b * (1.05f + Mathf.Clamp01(targetState.WorldLinearAcceleration.magnitude / 28f) * 0.45f);
+                        float reverseIntent = Mathf.Clamp01(-Mathf.Min(0f, targetState.MotorInputVertical));
+                        profileSmoothTime *= 1f + reverseIntent * 0.38f;
+                    }
+
+                    float smoothUpper = profile == MotionProfile.Tracked ? 0.44f : 0.30f;
+                    profileSmoothTime = Mathf.Clamp(profileSmoothTime + jitterWeight * 0.04f, 0.05f, smoothUpper);
+                    if (puppetVisual)
+                    {
+                        // Softer hull convergence: stowage / exterior props inherit root jitter from net corrections.
+                        float puppetCap = profile == MotionProfile.Tracked ? 0.52f : 0.38f;
+                        profileSmoothTime = Mathf.Min(profileSmoothTime * 1.28f, puppetCap);
+                    }
+
                     Vector3 blendedPos = Vector3.SmoothDamp(
                         currentPos,
                         targetPos,
@@ -514,6 +741,8 @@ internal static class ClientSimulationGovernor
                         deltaTime);
                     PositionVelByNetId[netId] = vel;
                     float rotT = profile == MotionProfile.Wheeled ? lerpT * 0.85f : lerpT;
+                    if (puppetVisual)
+                        rotT *= 0.56f;
                     Quaternion blendedRot = Quaternion.Slerp(currentRot, targetRot, rotT);
                     if (TryQueuePhysicsApply(unit, netId, blendedPos, blendedRot, hardSnap: false))
                     {
@@ -632,7 +861,7 @@ internal static class ClientSimulationGovernor
         }
     }
 
-    private static bool TrySampleBuffered(in BufferedState buffered, float renderTime, out SnapshotState sampled)
+    private static bool TrySampleBuffered(uint netId, Unit? unit, in BufferedState buffered, float renderTime, out SnapshotState sampled)
     {
         sampled = default;
         if (!buffered.HasNewer)
@@ -665,13 +894,83 @@ internal static class ClientSimulationGovernor
         }
 
         float t = Mathf.Clamp01((renderTime - a.SampleTime) / dt);
+        MotionProfile profile = unit != null
+            ? ResolveMotionProfile(netId, unit)
+            : MotionProfileByNetId.TryGetValue(netId, out MotionProfile mp) ? mp : MotionProfile.Unknown;
+
+        Vector3 pos;
+        Vector3 linVel;
+        if (profile == MotionProfile.Tracked)
+        {
+            HermiteTrackedPositionAndVelocity(a, b, t, dt, out pos, out linVel);
+            float chordMag = (b.Position - a.Position).magnitude;
+            float wireSpeedMax = Mathf.Max(a.WorldLinearVelocity.magnitude, b.WorldLinearVelocity.magnitude);
+            if (wireSpeedMax < TrackedIdleWireSpeedMaxMetersPerSec && chordMag < TrackedIdleChordForWireVelocityBlendMeters)
+                linVel = Vector3.Lerp(a.WorldLinearVelocity, b.WorldLinearVelocity, t);
+        }
+        else
+        {
+            pos = Vector3.Lerp(a.Position, b.Position, t);
+            linVel = Vector3.Lerp(a.WorldLinearVelocity, b.WorldLinearVelocity, t);
+        }
+
         sampled = new SnapshotState(
-            Vector3.Lerp(a.Position, b.Position, t),
+            pos,
             Quaternion.Slerp(a.HullRotation, b.HullRotation, t),
             Quaternion.Slerp(a.TurretWorldRotation, b.TurretWorldRotation, t),
             Quaternion.Slerp(a.GunWorldRotation, b.GunWorldRotation, t),
+            linVel,
+            Vector3.Lerp(a.WorldAngularVelocity, b.WorldAngularVelocity, t),
+            Mathf.Lerp(a.BrakePresentation01, b.BrakePresentation01, t),
+            Vector3.Lerp(a.WorldLinearAcceleration, b.WorldLinearAcceleration, t),
+            Mathf.Lerp(a.MotorInputVertical, b.MotorInputVertical, t),
             renderTime);
         return true;
+    }
+
+    /// <summary>
+    ///     Cubic Hermite between two host snapshots using endpoint world linear velocities as tangents (GHPC/NWH:
+    ///     tracked vehicles coast and brake through forces — linear pos+vel lerp looks toy-like on hard stops).
+    ///     Tangents are magnitude-clamped vs chord to limit overshoot when wire velocities disagree with displacement.
+    /// </summary>
+    private static void HermiteTrackedPositionAndVelocity(
+        in SnapshotState a,
+        in SnapshotState b,
+        float u,
+        float dtReal,
+        out Vector3 position,
+        out Vector3 worldLinearVelocity)
+    {
+        Vector3 p0 = a.Position;
+        Vector3 p1 = b.Position;
+        Vector3 v0 = a.WorldLinearVelocity;
+        Vector3 v1 = b.WorldLinearVelocity;
+        float dt = Mathf.Max(1e-4f, dtReal);
+        Vector3 m0 = v0 * dt;
+        Vector3 m1 = v1 * dt;
+        Vector3 chord = p1 - p0;
+        float chordMag = chord.magnitude;
+        float tanCap = Mathf.Max(chordMag * 1.65f, ExtrapolationMinSpeedMetersPerSec * dt * 0.55f);
+        tanCap = Mathf.Max(tanCap, 0.35f);
+        if (m0.sqrMagnitude > tanCap * tanCap)
+            m0 = m0.normalized * tanCap;
+        if (m1.sqrMagnitude > tanCap * tanCap)
+            m1 = m1.normalized * tanCap;
+
+        float u2 = u * u;
+        float u3 = u2 * u;
+        float h00 = 2f * u3 - 3f * u2 + 1f;
+        float h10 = u3 - 2f * u2 + u;
+        float h01 = -2f * u3 + 3f * u2;
+        float h11 = u3 - u2;
+        position = h00 * p0 + h10 * m0 + h01 * p1 + h11 * m1;
+
+        float dh00 = 6f * u2 - 6f * u;
+        float dh10 = 3f * u2 - 4f * u + 1f;
+        float dh01 = -6f * u2 + 6f * u;
+        float dh11 = 3f * u2 - 2f * u;
+        Vector3 dPdu = dh00 * p0 + dh10 * m0 + dh01 * p1 + dh11 * m1;
+        worldLinearVelocity = dPdu / dt;
     }
 
     private static void TryApplyAimables(uint netId, Unit unit, Quaternion turretWorld, Quaternion gunWorld, float lerpT)
@@ -764,7 +1063,7 @@ internal static class ClientSimulationGovernor
         bool warnedMissingVisual = binding.WarnedMissingVisual;
         binding = default;
         binding.WarnedMissingVisual = warnedMissingVisual;
-        if (TryPickAimables(unit, out AimablePlatform? traverseAp, out AimablePlatform? gunAp))
+        if (CoopAimableSampler.TryGetTraverseAndGun(unit, out AimablePlatform? traverseAp, out AimablePlatform? gunAp))
         {
             binding.TraverseAp = traverseAp;
             binding.GunAp = gunAp;
@@ -819,80 +1118,6 @@ internal static class ClientSimulationGovernor
         return null;
     }
 
-    private static bool TryPickAimables(Unit unit, out AimablePlatform? traverse, out AimablePlatform? gun)
-    {
-        traverse = null;
-        gun = null;
-
-        // Prefer main-weapon mount chain from FCS to avoid selecting unrelated aimables (e.g. roof MG).
-        FireControlSystem? fcs = unit.InfoBroker?.FCS;
-        if (fcs != null && TryPickAimablesFromFcs(fcs, out traverse, out gun))
-            return true;
-
-        AimablePlatform[]? aps = unit.AimablePlatforms;
-        if (aps == null || aps.Length == 0)
-            return false;
-        foreach (AimablePlatform? ap in aps)
-        {
-            if (ap == null || ap.Transform == null)
-                continue;
-            if (ap.ParentPlatform == null)
-            {
-                traverse = ap;
-                break;
-            }
-        }
-
-        traverse ??= aps[0];
-        if (traverse == null || traverse.Transform == null)
-            return false;
-        foreach (AimablePlatform? ap in aps)
-        {
-            if (ap == null || ap == traverse || ap.Transform == null)
-                continue;
-            if (ap.ParentPlatform == traverse || ap.Transform.IsChildOf(traverse.Transform))
-            {
-                gun = ap;
-                break;
-            }
-        }
-
-        return true;
-    }
-
-    private static bool TryPickAimablesFromFcs(FireControlSystem fcs, out AimablePlatform? traverse, out AimablePlatform? gun)
-    {
-        traverse = null;
-        gun = null;
-        AimablePlatform[]? mounts = fcs.Mounts;
-        if (mounts == null || mounts.Length == 0)
-            return false;
-
-        if (fcs.TurretPlatform != null)
-            traverse = fcs.TurretPlatform;
-        else
-            traverse = mounts[0];
-
-        if (mounts.Length >= 2)
-            gun = mounts[1];
-        else
-        {
-            for (int i = 0; i < mounts.Length; i++)
-            {
-                AimablePlatform? ap = mounts[i];
-                if (ap == null || ap == traverse)
-                    continue;
-                if (ap.ParentPlatform == traverse)
-                {
-                    gun = ap;
-                    break;
-                }
-            }
-        }
-
-        return traverse != null;
-    }
-
     private static void EnsureSuppressed(Unit unit, uint netId)
     {
         if (SuppressedByNetId.TryGetValue(netId, out bool already) && already)
@@ -904,6 +1129,8 @@ internal static class ClientSimulationGovernor
         SuppressedByNetId[netId] = true;
         _suppressedThisFrame++;
         _suppressOpsTotal++;
+        CoopRemotePuppetPresentationCache.Register(netId, unit);
+        CoopPuppetWheelRegistry.RegisterWheelsForPuppet(netId, unit);
     }
 
     private static void EnsureRestored(Unit unit, uint netId)
@@ -912,6 +1139,8 @@ internal static class ClientSimulationGovernor
             return;
         TrySetCrewAiEnabled(unit, enabled: true);
         TrySetMovementDriversEnabled(unit, netId, enabled: true);
+        CoopRemotePuppetPresentationCache.Remove(netId);
+        CoopPuppetWheelRegistry.UnregisterNetId(netId);
         SuppressedByNetId[netId] = false;
         _restoredThisFrame++;
         _restoreOpsTotal++;
@@ -962,6 +1191,8 @@ internal static class ClientSimulationGovernor
                 continue;
             TrySetCrewAiEnabled(u, enabled: true);
             TrySetMovementDriversEnabled(u, kv.Key, enabled: true);
+            CoopRemotePuppetPresentationCache.Remove(kv.Key);
+            CoopPuppetWheelRegistry.UnregisterNetId(kv.Key);
         }
     }
 
@@ -1050,6 +1281,25 @@ internal static class ClientSimulationGovernor
                     suppressed.Add((b, true));
                     b.enabled = false;
                 }
+
+                // Same as host CoopVanillaVehicleDriverMute: NwhChassis.FixedUpdate still runs with VC off and
+                // touches the chassis RB (parking brake / velocity), causing cm-scale wobble vs network pose.
+                NwhChassis? nwh = unit.GetComponentInChildren<NwhChassis>(true);
+                if (nwh != null && nwh.enabled)
+                {
+                    suppressed.Add((nwh, true));
+                    nwh.enabled = false;
+                }
+
+                if (!CoopNwhPuppetSettings.WheelControllerVisualsEnabled)
+                    CoopNwhWheelControllerSuppress.DisableAllOnUnit(unit, suppressed);
+
+                var rigging = new List<(VehicleController Vc, bool WasRiggingEnabled)>(2);
+                if (!CoopNwhPuppetSettings.RiggingEnabledOnPuppets)
+                    CoopNwhRiggingSuppress.DisableOnUnit(unit, rigging);
+                if (rigging.Count > 0)
+                    SuppressedRiggingByNetId[netId] = rigging;
+
                 SuppressedDriversByNetId[netId] = suppressed;
                 Rigidbody? rb = ResolveRigidbody(netId, unit);
                 if (rb != null)
@@ -1058,6 +1308,7 @@ internal static class ClientSimulationGovernor
                     rb.isKinematic = true;
                     rb.interpolation = RigidbodyInterpolation.None;
                 }
+
                 return suppressed.Count > 0;
             }
 
@@ -1072,6 +1323,11 @@ internal static class ClientSimulationGovernor
                     it.Behaviour.enabled = true;
             }
             SuppressedDriversByNetId.Remove(netId);
+            if (SuppressedRiggingByNetId.TryGetValue(netId, out List<(VehicleController Vc, bool WasRiggingEnabled)>? rig))
+            {
+                CoopNwhRiggingSuppress.Restore(rig);
+                SuppressedRiggingByNetId.Remove(netId);
+            }
             if (SuppressedRigidbodyStateByNetId.TryGetValue(netId, out var rbState))
             {
                 Rigidbody? rb = ResolveRigidbody(netId, unit);
@@ -1093,6 +1349,13 @@ internal static class ClientSimulationGovernor
 
     private static MotionProfile ResolveMotionProfile(uint netId, Unit unit)
     {
+        CoopRemotePuppetPresentationCache.TryGetVehicleController(netId, unit, out VehicleController? vc);
+        if (vc != null && vc.tracks != null && vc.tracks.trackedVehicle)
+        {
+            MotionProfileByNetId[netId] = MotionProfile.Tracked;
+            return MotionProfile.Tracked;
+        }
+
         if (MotionProfileByNetId.TryGetValue(netId, out MotionProfile existing))
             return existing;
         MotionProfile profile = MotionProfile.Unknown;
@@ -1121,4 +1384,265 @@ internal static class ClientSimulationGovernor
         MotionProfileByNetId[netId] = profile;
         return profile;
     }
+
+    internal static IEnumerable<uint> EnumerateSuppressedNetIds()
+    {
+        foreach (KeyValuePair<uint, bool> kv in SuppressedByNetId)
+        {
+            if (kv.Value)
+                yield return kv.Key;
+        }
+    }
+
+    /// <summary>True when this netId is a remote client puppet (soft suppress + movement drivers off).</summary>
+    internal static bool IsClientSuppressedPuppet(uint netId)
+    {
+        return SuppressedByNetId.TryGetValue(netId, out bool s) && s;
+    }
+
+    /// <summary>Min distance from <paramref name="world" /> to main camera and local controlled unit (for LOD).</summary>
+    internal static float MinDistanceToClientReferences(in Vector3 world)
+    {
+        float d = float.MaxValue;
+        var cam = global::UnityEngine.Camera.main;
+        if (cam != null)
+            d = Mathf.Min(d, Vector3.Distance(world, cam.transform.position));
+        Unit? u = CoopSessionState.ControlledUnit;
+        if (u != null)
+            d = Mathf.Min(d, Vector3.Distance(world, u.transform.position));
+        return d >= float.MaxValue * 0.5f ? 0f : d;
+    }
+
+    internal static bool TryGetNetIdWorldPosition(uint netId, out Vector3 world)
+    {
+        world = default;
+        Unit? u = CoopUnitLookup.TryFindByNetId(netId);
+        if (u == null)
+            return false;
+        world = u.transform.position;
+        return true;
+    }
+
+    /// <summary>Last merged GHW wire velocities only (no Hermite resample).</summary>
+    internal static bool TryGetWireVelocitiesOnly(uint netId, out Vector3 linear, out Vector3 angular)
+    {
+        linear = angular = default;
+        if (IsClientRemotePeerHullGhpOnly(netId))
+        {
+            linear = CoopRemoteState.RemoteWorldLinearVelocity;
+            angular = CoopRemoteState.RemoteWorldAngularVelocity;
+            return true;
+        }
+
+        bool okL = WireLinearVelocityByNetId.TryGetValue(netId, out linear);
+        bool okA = WireAngularVelocityByNetId.TryGetValue(netId, out angular);
+        return okL || okA;
+    }
+
+    /// <summary>
+    ///     One buffered Hermite sample for both display velocities (NWH puppet FixedUpdate — avoids double
+    ///     <see cref="TrySampleBuffered" /> vs separate linear/angular calls).
+    /// </summary>
+    internal static bool TryGetDisplayVelocities(uint netId, out Vector3 linear, out Vector3 angular)
+    {
+        linear = angular = default;
+        if (IsClientRemotePeerHullGhpOnly(netId))
+        {
+            linear = CoopRemoteState.RemoteWorldLinearVelocity;
+            angular = CoopRemoteState.RemoteWorldAngularVelocity;
+            return true;
+        }
+
+        if (BufferedByNetId.TryGetValue(netId, out BufferedState buf))
+        {
+            float renderTime = Time.time - GetAdaptiveInterpolationBackTime();
+            Unit? u = CoopUnitLookup.TryFindByNetId(netId);
+            if (TrySampleBuffered(netId, u, buf, renderTime, out SnapshotState s))
+            {
+                linear = s.WorldLinearVelocity;
+                angular = s.WorldAngularVelocity;
+                return true;
+            }
+        }
+
+        bool okL = WireLinearVelocityByNetId.TryGetValue(netId, out linear);
+        bool okA = WireAngularVelocityByNetId.TryGetValue(netId, out angular);
+        return okL || okA;
+    }
+
+    /// <summary>
+    ///     One buffered sample for linear + angular + motor (synthetic track LateUpdate — avoids triple
+    ///     <see cref="TrySampleBuffered" /> from vel + ang + motor calls).
+    /// </summary>
+    internal static bool TryGetDisplayLinAngMotor(uint netId, out Vector3 linear, out Vector3 angular, out float motorVertical)
+    {
+        linear = angular = default;
+        motorVertical = 0f;
+        if (IsClientRemotePeerHullGhpOnly(netId))
+        {
+            linear = CoopRemoteState.RemoteWorldLinearVelocity;
+            angular = CoopRemoteState.RemoteWorldAngularVelocity;
+            WireMotorVerticalByNetId.TryGetValue(netId, out motorVertical);
+            return true;
+        }
+
+        if (BufferedByNetId.TryGetValue(netId, out BufferedState buf))
+        {
+            float renderTime = Time.time - GetAdaptiveInterpolationBackTime();
+            Unit? u = CoopUnitLookup.TryFindByNetId(netId);
+            if (TrySampleBuffered(netId, u, buf, renderTime, out SnapshotState s))
+            {
+                linear = s.WorldLinearVelocity;
+                angular = s.WorldAngularVelocity;
+                motorVertical = s.MotorInputVertical;
+                return true;
+            }
+        }
+
+        bool okL = WireLinearVelocityByNetId.TryGetValue(netId, out linear);
+        bool okA = WireAngularVelocityByNetId.TryGetValue(netId, out angular);
+        bool okM = WireMotorVerticalByNetId.TryGetValue(netId, out motorVertical);
+        return okL || okA || okM;
+    }
+
+    /// <summary>Interpolated linear velocity from GHW buffer for smooth track UV.</summary>
+    internal static bool TryGetDisplayLinearVelocity(uint netId, out Vector3 velocity)
+    {
+        velocity = default;
+        if (IsClientRemotePeerHullGhpOnly(netId))
+        {
+            velocity = CoopRemoteState.RemoteWorldLinearVelocity;
+            return true;
+        }
+
+        if (BufferedByNetId.TryGetValue(netId, out BufferedState buf))
+        {
+            float renderTime = Time.time - GetAdaptiveInterpolationBackTime();
+            Unit? u = CoopUnitLookup.TryFindByNetId(netId);
+            if (TrySampleBuffered(netId, u, buf, renderTime, out SnapshotState s))
+            {
+                velocity = s.WorldLinearVelocity;
+                return true;
+            }
+        }
+
+        return WireLinearVelocityByNetId.TryGetValue(netId, out velocity);
+    }
+
+    /// <summary>Interpolated angular velocity (rad/s) from GHW buffer for track differential / wheel rim speed.</summary>
+    internal static bool TryGetDisplayAngularVelocity(uint netId, out Vector3 angularVelocity)
+    {
+        angularVelocity = default;
+        if (IsClientRemotePeerHullGhpOnly(netId))
+        {
+            angularVelocity = CoopRemoteState.RemoteWorldAngularVelocity;
+            return true;
+        }
+
+        if (BufferedByNetId.TryGetValue(netId, out BufferedState buf))
+        {
+            float renderTime = Time.time - GetAdaptiveInterpolationBackTime();
+            Unit? u = CoopUnitLookup.TryFindByNetId(netId);
+            if (TrySampleBuffered(netId, u, buf, renderTime, out SnapshotState s))
+            {
+                angularVelocity = s.WorldAngularVelocity;
+                return true;
+            }
+        }
+
+        return WireAngularVelocityByNetId.TryGetValue(netId, out angularVelocity);
+    }
+
+    internal static bool TryGetDisplayBrakePresentation01(uint netId, out float brake01)
+    {
+        brake01 = 0f;
+        if (IsClientRemotePeerHullGhpOnly(netId))
+        {
+            brake01 = CoopRemoteState.RemoteBrakePresentation01;
+            return true;
+        }
+
+        if (BufferedByNetId.TryGetValue(netId, out BufferedState buf))
+        {
+            float renderTime = Time.time - GetAdaptiveInterpolationBackTime();
+            Unit? u = CoopUnitLookup.TryFindByNetId(netId);
+            if (TrySampleBuffered(netId, u, buf, renderTime, out SnapshotState s))
+            {
+                brake01 = s.BrakePresentation01;
+                return true;
+            }
+        }
+
+        return WireBrakePresentationByNetId.TryGetValue(netId, out brake01);
+    }
+
+    /// <summary>Interpolated linear acceleration (m/s²) from GHW v5 buffer; zero if v4-only peer.</summary>
+    internal static bool TryGetDisplayLinearAcceleration(uint netId, out Vector3 acceleration)
+    {
+        acceleration = default;
+        if (BufferedByNetId.TryGetValue(netId, out BufferedState buf))
+        {
+            float renderTime = Time.time - GetAdaptiveInterpolationBackTime();
+            Unit? u = CoopUnitLookup.TryFindByNetId(netId);
+            if (TrySampleBuffered(netId, u, buf, renderTime, out SnapshotState s))
+            {
+                acceleration = s.WorldLinearAcceleration;
+                return true;
+            }
+        }
+
+        return WireLinearAccelerationByNetId.TryGetValue(netId, out acceleration);
+    }
+
+    /// <summary>Latest or interpolated GHW v6 motor axis (−1…1); 0 if buffer/v6 data missing.</summary>
+    internal static bool TryGetDisplayMotorInputVertical(uint netId, out float motorVertical)
+    {
+        motorVertical = 0f;
+        if (BufferedByNetId.TryGetValue(netId, out BufferedState buf))
+        {
+            float renderTime = Time.time - GetAdaptiveInterpolationBackTime();
+            Unit? u = CoopUnitLookup.TryFindByNetId(netId);
+            if (TrySampleBuffered(netId, u, buf, renderTime, out SnapshotState s))
+            {
+                motorVertical = s.MotorInputVertical;
+                return true;
+            }
+        }
+
+        return WireMotorVerticalByNetId.TryGetValue(netId, out motorVertical);
+    }
+
+    internal static IEnumerable<uint> EnumerateBufferedNetIds()
+    {
+        foreach (KeyValuePair<uint, BufferedState> kv in BufferedByNetId)
+            yield return kv.Key;
+    }
+
+    internal static bool IsSoftSuppressionConfigured => _softSuppressEnabled;
+
+    internal static bool IsSuppressDegraded => _degradedToSuppressOff;
+
+    internal static bool IsCorrectionDegraded => _degradedToCorrectionOff;
+
+    internal static bool IsGovernorEnabled => _enabled;
+
+    internal static bool IsGovernorSkippedAsLocalOwned(uint netId)
+    {
+        uint localControlledNetId = 0;
+        Unit? localControlled = CoopSessionState.ControlledUnit;
+        if (localControlled != null)
+            localControlledNetId = CoopUnitWireRegistry.GetWireId(localControlled);
+        return netId == localControlledNetId || CoopVehicleOwnership.IsLocalOwner(netId);
+    }
+
+    /// <summary>True when this netId is the lobby peer on an observer client: hull motion is GHP-only (not GHW buffer).</summary>
+    internal static bool IsClientRemotePeerHullGhpOnly(uint netId) =>
+        CoopUdpTransport.IsClient && CoopRemoteState.HasData && CoopRemoteState.RemoteUnitNetId != 0
+        && netId == CoopRemoteState.RemoteUnitNetId;
+
+    internal static bool TryGetLatestWireLinearVelocity(uint netId, out Vector3 velocity) =>
+        WireLinearVelocityByNetId.TryGetValue(netId, out velocity);
+
+    internal static bool TryGetLatestWireAngularVelocity(uint netId, out Vector3 angularVelocity) =>
+        WireAngularVelocityByNetId.TryGetValue(netId, out angularVelocity);
 }

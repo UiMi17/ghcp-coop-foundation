@@ -1,3 +1,6 @@
+using GHPC.CoopFoundation.Diagnostics;
+using GHPC.CoopFoundation.Networking;
+using GHPC.CoopFoundation.Networking.NwhPuppet;
 using GHPC.CoopFoundation.Patches;
 using MelonLoader;
 using UnityEngine;
@@ -46,8 +49,9 @@ public sealed class CoopFoundationMod : MelonMod
     private static readonly MelonPreferences_Entry<int> NetworkRemotePort =
         PrefCategory.CreateEntry("NetworkRemotePort", 27015);
 
+    /// <summary>Verbose per-datagram GHP recv logs — very expensive with MelonLoader console + disk I/O; default off.</summary>
     private static readonly MelonPreferences_Entry<bool> LogNetworkReceive =
-        PrefCategory.CreateEntry("LogNetworkReceive", true);
+        PrefCategory.CreateEntry("LogNetworkReceive", false);
 
     private static readonly MelonPreferences_Entry<bool> LogMissionMismatch =
         PrefCategory.CreateEntry("LogMissionMismatch", true);
@@ -197,6 +201,12 @@ public sealed class CoopFoundationMod : MelonMod
     private static readonly MelonPreferences_Entry<bool> HostPeerBodySyncLog =
         PrefCategory.CreateEntry("HostPeerBodySyncLog", false);
 
+    private static readonly MelonPreferences_Entry<bool> ClientPeerBodySyncEnabled =
+        PrefCategory.CreateEntry("ClientPeerBodySyncEnabled", true);
+
+    private static readonly MelonPreferences_Entry<bool> ClientPeerBodySyncLog =
+        PrefCategory.CreateEntry("ClientPeerBodySyncLog", false);
+
     /// <summary>Phase 5: correction-first governor for non-local client units.</summary>
     private static readonly MelonPreferences_Entry<bool> ClientSimulationSuppressionEnabled =
         PrefCategory.CreateEntry("ClientSimulationSuppressionEnabled", true);
@@ -213,6 +223,33 @@ public sealed class CoopFoundationMod : MelonMod
     private static readonly MelonPreferences_Entry<bool> ClientSimulationLog =
         PrefCategory.CreateEntry("ClientSimulationLog", false);
 
+    /// <summary>Client puppet: keep NWH <c>WheelController</c> running with injected wire velocity; skip chassis forces.</summary>
+    private static readonly MelonPreferences_Entry<bool> NetworkNwhPuppetWheelControllerEnabled =
+        PrefCategory.CreateEntry("NetworkNwhPuppetWheelControllerEnabled", true);
+
+    /// <summary>Client puppet: leave NWH rigging enabled (requires live suspension).</summary>
+    private static readonly MelonPreferences_Entry<bool> NetworkNwhPuppetRiggingEnabled =
+        PrefCategory.CreateEntry("NetworkNwhPuppetRiggingEnabled", false);
+
+    /// <summary>Host GHW: append linear acceleration (v5 wire); improves client extrapolation / NWH read-path.</summary>
+    private static readonly MelonPreferences_Entry<bool> WorldReplicationGhwV5Acceleration =
+        PrefCategory.CreateEntry("WorldReplicationGhwV5Acceleration", true);
+
+    /// <summary>Host GHW v6: replicate NWH <c>input.Vertical</c> (throttle/brake intent); requires v5 acceleration on wire.</summary>
+    private static readonly MelonPreferences_Entry<bool> WorldReplicationGhwV6MotorInput =
+        PrefCategory.CreateEntry("WorldReplicationGhwV6MotorInput", true);
+
+    /// <summary>Host: temporarily raise GHW send rate while braking / hard decel (same packet layout).</summary>
+    private static readonly MelonPreferences_Entry<bool> WorldReplicationBrakeBoostEnabled =
+        PrefCategory.CreateEntry("WorldReplicationBrakeBoostEnabled", true);
+
+    /// <summary>Use <see cref="double"/> entries so TOML serializes as <c>2.1</c> (never <c>2.1f</c>), which Tomlet rejects.</summary>
+    private static readonly MelonPreferences_Entry<double> WorldReplicationBrakeBoostHzMultiplier =
+        PrefCategory.CreateEntry("WorldReplicationBrakeBoostHzMultiplier", 2.1);
+
+    private static readonly MelonPreferences_Entry<double> WorldReplicationBrakeBoostSustainSeconds =
+        PrefCategory.CreateEntry("WorldReplicationBrakeBoostSustainSeconds", 0.22);
+
     /// <summary>If true, disable phase 5 correction on first runtime exception.</summary>
     private static readonly MelonPreferences_Entry<bool> ClientSimulationSafeMode =
         PrefCategory.CreateEntry("ClientSimulationSafeMode", true);
@@ -220,6 +257,58 @@ public sealed class CoopFoundationMod : MelonMod
     /// <summary>Trace post-apply turret/gun overwrites by LateFollow/constraints (diagnostics).</summary>
     private static readonly MelonPreferences_Entry<bool> ClientSimulationAimTrace =
         PrefCategory.CreateEntry("ClientSimulationAimTrace", false);
+
+    /// <summary>Client governor: distance LOD + round-robin for aim/hull on far units (reduces sustained LateUpdate CPU).</summary>
+    private static readonly MelonPreferences_Entry<bool> ClientGovernorLodEnabled =
+        PrefCategory.CreateEntry("ClientGovernorLodEnabled", true);
+
+    private static readonly MelonPreferences_Entry<double> ClientGovernorLodNearMeters =
+        PrefCategory.CreateEntry("ClientGovernorLodNearMeters", 220.0);
+
+    private static readonly MelonPreferences_Entry<double> ClientGovernorLodMidMeters =
+        PrefCategory.CreateEntry("ClientGovernorLodMidMeters", 550.0);
+
+    /// <summary>Tier 1 (mid distance): run aim every N frames (1 = every frame).</summary>
+    private static readonly MelonPreferences_Entry<int> ClientGovernorLodMidAimEveryFrames =
+        PrefCategory.CreateEntry("ClientGovernorLodMidAimEveryFrames", 2);
+
+    /// <summary>Tier 2 (far): run hull correction every N frames (1 = every frame).</summary>
+    private static readonly MelonPreferences_Entry<int> ClientGovernorLodFarHullEveryFrames =
+        PrefCategory.CreateEntry("ClientGovernorLodFarHullEveryFrames", 2);
+
+    /// <summary>Tier 2 (far): aim every N frames; 0 = no aim in far tier.</summary>
+    private static readonly MelonPreferences_Entry<int> ClientGovernorLodFarAimEveryFrames =
+        PrefCategory.CreateEntry("ClientGovernorLodFarAimEveryFrames", 6);
+
+    /// <summary>Max units receiving hull correction per frame (soft cap inside governor budget formula).</summary>
+    private static readonly MelonPreferences_Entry<int> ClientGovernorCorrectionBudgetMax =
+        PrefCategory.CreateEntry("ClientGovernorCorrectionBudgetMax", 72);
+
+    /// <summary>
+    ///     Beyond this distance (m) from camera/local unit, NWH puppet wheels use last GHW wire velocity only (skips Hermite resample). 0 = off.
+    /// </summary>
+    private static readonly MelonPreferences_Entry<double> NetworkNwhWheelWireOnlyBeyondMeters =
+        PrefCategory.CreateEntry("NetworkNwhWheelWireOnlyBeyondMeters", 0.0);
+
+    /// <summary>
+    ///     Verbose replication tracing (wire map, GHW/GHP accept/reject, missing Unit for netId). Enable while debugging peer desync / invisible vehicles.
+    /// </summary>
+    private static readonly MelonPreferences_Entry<bool> LogReplicationDiagnostics =
+        PrefCategory.CreateEntry("LogReplicationDiagnostics", false);
+
+    /// <summary>Throttled host+client player vs peer comparison (RB/VC/AI, GHP remote, GHW buffer + governor).</summary>
+    private static readonly MelonPreferences_Entry<bool> LogPlayerReplicationScenario =
+        PrefCategory.CreateEntry("LogPlayerReplicationScenario", false);
+
+    private static readonly MelonPreferences_Entry<double> LogPlayerReplicationScenarioIntervalSec =
+        PrefCategory.CreateEntry("LogPlayerReplicationScenarioIntervalSec", 2.0);
+
+    /// <summary>Steam build: aggregate Stopwatch timings for major mod sections; log avg/max µs once per interval (no Unity Profiler).</summary>
+    private static readonly MelonPreferences_Entry<bool> CpuSectionDiagnosticsEnabled =
+        PrefCategory.CreateEntry("CpuSectionDiagnosticsEnabled", false);
+
+    private static readonly MelonPreferences_Entry<double> CpuSectionDiagnosticsIntervalSec =
+        PrefCategory.CreateEntry("CpuSectionDiagnosticsIntervalSec", 1.0);
 
     public override void OnInitializeMelon()
     {
@@ -232,7 +321,7 @@ public sealed class CoopFoundationMod : MelonMod
         LoggerInstance.Msg(
             $"GHPC Coop Foundation {CoopModMetadata.Version} — Harmony patches applied ({HarmonyId}).");
         LoggerInstance.Msg(
-            "Network: UDP GHP v3 + GHW world + GHC combat (+ ImpactFx + ParticleImpact + Explosion + muzzle replay + DamageState); COO (+ WorldEnv); phase5 governor; phase6 cosmetic channel.");
+            "Network: UDP GHP v6 + GHW v4/v5/v6 world (v6 motor + brake-boost send) + GHC combat (+ ImpactFx + ParticleImpact + Explosion + muzzle replay + DamageState); COO (+ WorldEnv); phase5 governor; NWH puppet wheel visuals; phase6 cosmetic channel.");
 
         // Phase 6 M2: keep network menu-authoritative in main menu flow.
         // We still apply transport prefs continuously in OnUpdate.
@@ -250,13 +339,27 @@ public sealed class CoopFoundationMod : MelonMod
 
     public override void OnUpdate()
     {
+        CoopCpuDiag.Configure(
+            CpuSectionDiagnosticsEnabled.Value,
+            (float)CpuSectionDiagnosticsIntervalSec.Value);
+
         PatchSimpleRoundCoopCosmetic.TryApply(_harmony);
         PatchBuildMenuControllerMultiplayerButton.TickLobbyControllers();
-        CoopUdpTransport.SetWorldReplicationPrefs(
+        using (CoopCpuDiag.Start("Cpu.Update_PrefsAndTransport"))
+        {
+            CoopNwhPuppetSettings.WheelControllerVisualsEnabled = NetworkNwhPuppetWheelControllerEnabled.Value;
+            CoopNwhPuppetSettings.RiggingEnabledOnPuppets = NetworkNwhPuppetRiggingEnabled.Value;
+            CoopNwhPuppetSettings.WheelWireOnlyBeyondMeters = (float)NetworkNwhWheelWireOnlyBeyondMeters.Value;
+            CoopUdpTransport.SetWorldReplicationPrefs(
             WorldReplicationEnabled.Value,
             WorldReplicationHz.Value,
             LogWorldReplication.Value,
-            LogWorldReplication.Value);
+            LogWorldReplication.Value,
+            WorldReplicationGhwV5Acceleration.Value,
+            WorldReplicationGhwV6MotorInput.Value,
+            WorldReplicationBrakeBoostEnabled.Value,
+            (float)WorldReplicationBrakeBoostHzMultiplier.Value,
+            (float)WorldReplicationBrakeBoostSustainSeconds.Value);
         CoopUdpTransport.SetWorldEnvironmentReplicationPrefs(
             WorldEnvironmentReplicationEnabled.Value,
             WorldEnvironmentReplicationHz.Value,
@@ -292,22 +395,47 @@ public sealed class CoopFoundationMod : MelonMod
             ClientSimulationCorrectionStrength.Value,
             ClientSimulationSoftSuppressEnabled.Value,
             ClientSimulationLog.Value,
-            ClientSimulationSafeMode.Value);
+            ClientSimulationSafeMode.Value,
+            ClientGovernorLodEnabled.Value,
+            (float)ClientGovernorLodNearMeters.Value,
+            (float)ClientGovernorLodMidMeters.Value,
+            ClientGovernorLodMidAimEveryFrames.Value,
+            ClientGovernorLodFarHullEveryFrames.Value,
+            ClientGovernorLodFarAimEveryFrames.Value,
+            ClientGovernorCorrectionBudgetMax.Value);
         AimOverwriteProbe.Configure(ClientSimulationAimTrace.Value);
-        HostPeerUnitPuppet.Enabled = HostPeerBodySyncEnabled.Value;
-        HostPeerUnitPuppet.Log = HostPeerBodySyncLog.Value;
-        CoopUdpTransport.ProcessInbound();
+        CoopReplicationDiagnostics.Configure(LogReplicationDiagnostics.Value);
+        CoopPlayerScenarioDiagnostics.Configure(
+            LogPlayerReplicationScenario.Value,
+            (float)LogPlayerReplicationScenarioIntervalSec.Value);
+            HostPeerUnitPuppet.Enabled = HostPeerBodySyncEnabled.Value;
+            HostPeerUnitPuppet.Log = HostPeerBodySyncLog.Value;
+            ClientPeerUnitPuppet.Enabled = ClientPeerBodySyncEnabled.Value;
+            ClientPeerUnitPuppet.Log = ClientPeerBodySyncLog.Value;
+        }
+
+        using (CoopCpuDiag.Start("Cpu.Update_ProcessInbound"))
+            CoopUdpTransport.ProcessInbound();
         if (CoopUdpTransport.IsClient)
-            CoopWorldEnvironmentReplication.TryFlushPendingIfPossible(LogWorldEnvironmentSync.Value);
-        CoopUdpTransport.DrainClientCombatApply();
-        ClientSimulationGovernor.TickUpdate(Time.deltaTime);
-        CoopUdpTransport.NetworkSessionTick();
-        CoopUdpTransport.HostTickWorldReplication(Time.deltaTime);
-        LocalPlayerSampler.Tick(
-            Time.time,
-            Time.deltaTime,
-            LogLocalSnapshot.Value,
-            SnapshotLogIntervalSeconds.Value);
+        {
+            using (CoopCpuDiag.Start("Cpu.Update_WorldEnvFlush"))
+                CoopWorldEnvironmentReplication.TryFlushPendingIfPossible(LogWorldEnvironmentSync.Value);
+        }
+
+        using (CoopCpuDiag.Start("Cpu.Update_DrainCombat"))
+            CoopUdpTransport.DrainClientCombatApply();
+        using (CoopCpuDiag.Start("Cpu.Update_GovernorTickUpdate"))
+            ClientSimulationGovernor.TickUpdate(Time.deltaTime);
+        using (CoopCpuDiag.Start("Cpu.Update_NetworkSessionTick"))
+            CoopUdpTransport.NetworkSessionTick();
+        using (CoopCpuDiag.Start("Cpu.Update_HostWorldReplication"))
+            CoopUdpTransport.HostTickWorldReplication(Time.deltaTime);
+        using (CoopCpuDiag.Start("Cpu.Update_LocalPlayerSampler"))
+            LocalPlayerSampler.Tick(
+                Time.time,
+                Time.deltaTime,
+                LogLocalSnapshot.Value,
+                SnapshotLogIntervalSeconds.Value);
     }
 
     public override void OnGUI()
@@ -335,26 +463,48 @@ public sealed class CoopFoundationMod : MelonMod
     public override void OnLateUpdate()
     {
         if (CoopUdpTransport.IsHost)
-            HostCombatBroadcast.FlushPendingHitResolved(CoopUdpTransport.CombatReplicationLogDamageState);
-        ClientSimulationGovernor.TickLateUpdate(Time.deltaTime);
-        HostPeerUnitPuppet.TickLateUpdate();
-        CoopAtJetVisualReplay.Tick(Time.deltaTime);
-        RemoteGhostService.TickLateUpdate(ShowRemoteGhost.Value, RemoteGhostSmoothing.Value, RemoteGhostYOffset.Value);
-        ClientWorldProxyService.TickLateUpdate(
-            ShowWorldProxies.Value,
-            WorldProxySmoothing.Value,
-            WorldProxyYOffset.Value);
+        {
+            using (CoopCpuDiag.Start("Cpu.Late_HitResolvedFlush"))
+                HostCombatBroadcast.FlushPendingHitResolved(CoopUdpTransport.CombatReplicationLogDamageState);
+        }
+
+        using (CoopCpuDiag.Start("Cpu.Late_GovernorTickLateUpdate"))
+            ClientSimulationGovernor.TickLateUpdate(Time.deltaTime);
+        using (CoopCpuDiag.Start("Cpu.Late_PuppetVisualOrchestrator"))
+            CoopRemotePuppetVisualLateOrchestrator.Tick(Time.deltaTime);
+        using (CoopCpuDiag.Start("Cpu.Late_HostPeer"))
+            HostPeerUnitPuppet.TickLateUpdate();
+        using (CoopCpuDiag.Start("Cpu.Late_ClientPeer"))
+            ClientPeerUnitPuppet.TickLateUpdate();
+        using (CoopCpuDiag.Start("Cpu.Late_AtJetVisualReplay"))
+            CoopAtJetVisualReplay.Tick(Time.deltaTime);
+        using (CoopCpuDiag.Start("Cpu.Late_RemoteGhost"))
+            RemoteGhostService.TickLateUpdate(ShowRemoteGhost.Value, RemoteGhostSmoothing.Value, RemoteGhostYOffset.Value);
+        using (CoopCpuDiag.Start("Cpu.Late_WorldProxy"))
+            ClientWorldProxyService.TickLateUpdate(
+                ShowWorldProxies.Value,
+                WorldProxySmoothing.Value,
+                WorldProxyYOffset.Value);
+        using (CoopCpuDiag.Start("Cpu.Late_PlayerScenarioDiag"))
+            CoopPlayerScenarioDiagnostics.TickLateUpdate();
+
+        CoopCpuDiag.FlushIfDue(Time.unscaledTime);
     }
 
     public override void OnFixedUpdate()
     {
-        HostPeerUnitPuppet.TickFixedUpdate();
-        ClientSimulationGovernor.TickFixedUpdate();
+        using (CoopCpuDiag.Start("Cpu.Fixed_HostPeer"))
+            HostPeerUnitPuppet.TickFixedUpdate();
+        using (CoopCpuDiag.Start("Cpu.Fixed_ClientPeer"))
+            ClientPeerUnitPuppet.TickFixedUpdate();
+        using (CoopCpuDiag.Start("Cpu.Fixed_Governor"))
+            ClientSimulationGovernor.TickFixedUpdate();
     }
 
     public override void OnApplicationQuit()
     {
         HostPeerUnitPuppet.Reset();
+        ClientPeerUnitPuppet.Reset();
         RemoteGhostService.Destroy();
         ClientWorldProxyService.ClearAll();
         CoopUdpTransport.Shutdown();

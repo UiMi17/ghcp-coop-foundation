@@ -32,6 +32,7 @@ internal static class CoopUnitWireRegistry
         _nextSynthetic = SyntheticIdBase;
         _lastRefreshFrame = -1;
         _loggedCollision = false;
+        CoopReplicationDiagnostics.NotifySessionReset();
     }
 
     /// <summary>Rebuild map at most once per Unity frame (main thread).</summary>
@@ -84,11 +85,11 @@ internal static class CoopUnitWireRegistry
 
         var occupied = new HashSet<uint>(UnitToWire.Values);
 
+        // Cross-peer determinism: host GHW netIds must resolve to the same local Unit on every peer.
+        // Sorting by world position broke parity — tiny spawn/floating‑point differences reorder collision ties,
+        // so synthetic ids diverged → TryResolveUnit(hostNetId) fails → no puppet/corrections and “missing” peers.
         List<Unit> sorted = live
             .OrderBy(u => u.UniqueName ?? "", StringComparer.Ordinal)
-            .ThenBy(u => u.transform.position.x)
-            .ThenBy(u => u.transform.position.y)
-            .ThenBy(u => u.transform.position.z)
             .ThenBy(u => u.gameObject.name, StringComparer.Ordinal)
             .ToList();
 
@@ -112,6 +113,8 @@ internal static class CoopUnitWireRegistry
                     MelonLogger.Warning(
                         "[CoopNet] Unit wire id: FNV collision — assigning synthetic id (once per session log).");
                 }
+
+                CoopReplicationDiagnostics.LogSyntheticWire(wire, nat, u);
             }
 
             UnitToWire[u] = wire;
@@ -121,6 +124,11 @@ internal static class CoopUnitWireRegistry
         WireToUnit.Clear();
         foreach (KeyValuePair<Unit, uint> kv in UnitToWire)
             WireToUnit[kv.Value] = kv.Key;
+
+        if (WireToUnit.Count != UnitToWire.Count)
+            CoopReplicationDiagnostics.LogDuplicateWireMaps(WireToUnit.Count, UnitToWire.Count);
+
+        CoopReplicationDiagnostics.MaybeLogFullWireMap(UnitToWire);
     }
 
     private static uint AllocateSynthetic(HashSet<uint> occupied)

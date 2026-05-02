@@ -13,6 +13,15 @@ internal static class CoopRemoteState
 
     public static Vector3 RemotePosition { get; private set; }
 
+    /// <summary>World linear velocity (m/s) from peer GHP v4 snapshot.</summary>
+    public static Vector3 RemoteWorldLinearVelocity { get; private set; }
+
+    /// <summary>World angular velocity (rad/s) from peer GHP v5 snapshot.</summary>
+    public static Vector3 RemoteWorldAngularVelocity { get; private set; }
+
+    /// <summary>Brake presentation 0–1 from peer GHP v6.</summary>
+    public static float RemoteBrakePresentation01 { get; private set; }
+
     public static Quaternion RemoteHullRotation { get; private set; }
 
     public static Quaternion RemoteTurretWorldRotation { get; private set; }
@@ -28,12 +37,18 @@ internal static class CoopRemoteState
         Quaternion hullRotation,
         Quaternion turretWorldRotation,
         Quaternion gunWorldRotation,
-        uint unitNetId)
+        uint unitNetId,
+        Vector3 worldLinearVelocity,
+        Vector3 worldAngularVelocity,
+        float brakePresentation01)
     {
         HasData = true;
         LastSequence = sequence;
         RemoteUnitInstanceId = instanceId;
         RemotePosition = position;
+        RemoteWorldLinearVelocity = worldLinearVelocity;
+        RemoteWorldAngularVelocity = worldAngularVelocity;
+        RemoteBrakePresentation01 = brakePresentation01;
         RemoteHullRotation = hullRotation;
         RemoteTurretWorldRotation = turretWorldRotation;
         RemoteGunWorldRotation = gunWorldRotation;
@@ -46,6 +61,9 @@ internal static class CoopRemoteState
         LastSequence = 0;
         RemoteUnitInstanceId = 0;
         RemotePosition = default;
+        RemoteWorldLinearVelocity = default;
+        RemoteWorldAngularVelocity = default;
+        RemoteBrakePresentation01 = 0f;
         RemoteHullRotation = default;
         RemoteTurretWorldRotation = Quaternion.identity;
         RemoteGunWorldRotation = Quaternion.identity;

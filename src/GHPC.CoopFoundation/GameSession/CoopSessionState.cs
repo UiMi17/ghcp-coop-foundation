@@ -1,5 +1,7 @@
 using GHPC;
+using GHPC.CoopFoundation.Networking;
 using GHPC.State;
+using NWH.VehiclePhysics;
 using UnityEngine;
 
 namespace GHPC.CoopFoundation.GameSession;
@@ -28,6 +30,14 @@ internal static class CoopSessionState
     public static Unit? ControlledUnit { get; private set; }
 
     public static Vector3 LastSampledPosition { get; private set; }
+
+    public static Vector3 LastSampledWorldLinearVelocity { get; private set; }
+
+    /// <summary>World-space angular velocity (rad/s) from chassis rigidbody for GHP/GHW replication.</summary>
+    public static Vector3 LastSampledWorldAngularVelocity { get; private set; }
+
+    /// <summary>0–1 brake hint from local <see cref="VehicleController" /> for GHP v6.</summary>
+    public static float LastSampledBrakePresentation01 { get; private set; }
 
     public static Quaternion LastSampledRotation { get; private set; }
 
@@ -90,6 +100,9 @@ internal static class CoopSessionState
         MissionSceneKey = "";
         ControlledUnit = null;
         LastSampledPosition = default;
+        LastSampledWorldLinearVelocity = default;
+        LastSampledWorldAngularVelocity = default;
+        LastSampledBrakePresentation01 = 0f;
         LastSampledRotation = default;
         LastSampledTurretWorldRotation = Quaternion.identity;
         LastSampledGunWorldRotation = Quaternion.identity;
@@ -113,6 +126,22 @@ internal static class CoopSessionState
         Transform t = unit.transform;
         LastSampledPosition = t.position;
         LastSampledRotation = t.rotation;
+        Vector3 vel = Vector3.zero;
+        Rigidbody? rb = unit.Chassis?.Rigidbody;
+        if (rb == null)
+            rb = unit.GetComponentInParent<Rigidbody>();
+        rb ??= unit.GetComponentInChildren<Rigidbody>();
+        Vector3 ang = Vector3.zero;
+        if (rb != null)
+        {
+            vel = rb.velocity;
+            ang = rb.angularVelocity;
+        }
+
+        LastSampledWorldLinearVelocity = vel;
+        LastSampledWorldAngularVelocity = ang;
+        VehicleController? vc = unit.GetComponentInChildren<VehicleController>(true);
+        LastSampledBrakePresentation01 = CoopVehicleBrakeSampler.SampleBrake01(vc);
         CoopAimableSampler.SampleWorldRotations(unit, t.rotation, out Quaternion tw, out Quaternion gw);
         LastSampledTurretWorldRotation = tw;
         LastSampledGunWorldRotation = gw;

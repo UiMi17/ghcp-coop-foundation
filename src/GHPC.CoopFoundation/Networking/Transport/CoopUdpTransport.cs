@@ -3,6 +3,9 @@ using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using GHPC.CoopFoundation.Networking;
+using GHPC.CoopFoundation.Networking.Client;
+using GHPC.CoopFoundation.Networking.Host;
 using GHPC.Mission;
 using GHPC.State;
 using MelonLoader;
@@ -17,7 +20,7 @@ internal enum CoopNetRole
     Client
 }
 
-/// <summary>UDP exchange of <see cref="CoopNetPacket" /> v3 (v2/v1 still accepted as legacy).</summary>
+/// <summary>UDP exchange of <see cref="CoopNetPacket" /> v4 (v3/v2/v1 still accepted as legacy).</summary>
 internal static class CoopUdpTransport
 {
     private const byte WirePlaying = 2;
@@ -44,6 +47,13 @@ internal static class CoopUdpTransport
     private static byte[]? _sendBuffer;
 
     private static bool _logReceive;
+
+    /// <summary>When <see cref="_logReceive" /> is on, cap recv line spam (ProcessInbound can dequeue many GHP/tick).</summary>
+    private static float _verboseRecvLogPeriodEnd;
+
+    private static int _verboseRecvLogsThisPeriod;
+
+    private const int VerboseRecvLogCapPerSecond = 12;
 
     private static bool _logMissionMismatch = true;
     private static bool _enforceVehicleOwnership = true;
@@ -356,12 +366,28 @@ internal static class CoopUdpTransport
         }
     }
 
-    public static void SetWorldReplicationPrefs(bool enabled, float hz, bool logSend, bool logReceive)
+    private static bool _worldReplicationGhwV5Acceleration = true;
+
+    private static bool _worldReplicationGhwV6MotorInput = true;
+
+    public static void SetWorldReplicationPrefs(
+        bool enabled,
+        float hz,
+        bool logSend,
+        bool logReceive,
+        bool ghwV5LinearAcceleration = true,
+        bool ghwV6MotorInput = true,
+        bool brakeBoostEnabled = true,
+        float brakeBoostHzMultiplier = 2.1f,
+        float brakeBoostSustainSeconds = 0.22f)
     {
         _worldReplicationEnabled = enabled;
         _worldReplicationHz = hz <= 0f ? 5f : hz;
         _logWorldReplicationSend = logSend;
         _logWorldReplicationReceive = logReceive;
+        _worldReplicationGhwV5Acceleration = ghwV5LinearAcceleration;
+        _worldReplicationGhwV6MotorInput = ghwV6MotorInput;
+        HostWorldReplication.ConfigureBrakeBoost(brakeBoostEnabled, brakeBoostHzMultiplier, brakeBoostSustainSeconds);
     }
 
     public static void ConfigureAndStart(
@@ -411,7 +437,7 @@ internal static class CoopUdpTransport
                 MelonLogger.Msg($"[CoopNet] Client will send to {_serverEndPoint}");
             }
 
-            _sendBuffer = new byte[CoopNetPacket.LengthV3];
+            _sendBuffer = new byte[CoopNetPacket.LengthV6];
             int controlCap = CoopControlPacket.SyncHeaderLength + CoopControlPacket.MaxSyncEntries * 8;
             if (CoopControlPacket.MissionLaunchInfoMaxTotalLength > controlCap)
                 controlCap = CoopControlPacket.MissionLaunchInfoMaxTotalLength;
@@ -1054,6 +1080,11 @@ internal static class CoopUdpTransport
             if (!AcceptRemoteSnapshot(snap.LegacyV1, snap.MissionToken, snap.MissionPhaseWire))
             {
                 CoopRemoteState.Clear();
+                CoopReplicationDiagnostics.LogGhpRejected(
+                    snap.MissionToken,
+                    snap.MissionPhaseWire,
+                    CoopSessionState.MissionCoherenceToken,
+                    snap.LegacyV1);
                 LogMissionMismatchThrottled(snap.MissionToken, snap.MissionPhaseWire, snap.LegacyV1);
                 continue;
             }
@@ -1067,16 +1098,36 @@ internal static class CoopUdpTransport
                 snap.HullRotation,
                 snap.TurretWorldRotation,
                 snap.GunWorldRotation,
-                snap.UnitNetId);
+                snap.UnitNetId,
+                snap.WorldLinearVelocity,
+                snap.WorldAngularVelocity,
+                snap.BrakePresentation01);
+            CoopReplicationDiagnostics.LogGhpApplied(
+                snap.Sequence,
+                snap.UnitNetId,
+                snap.MissionToken,
+                snap.MissionPhaseWire,
+                snap.Position);
             if (_logReceive)
             {
-                Vector3 e = snap.HullRotation.eulerAngles;
-                string extra = snap.LegacyV1
-                    ? " legacy=v1"
-                    : $" token={snap.MissionToken} phase={snap.MissionPhaseWire}";
-                MelonLogger.Msg(
-                    $"[CoopNet] recv seq={snap.Sequence} id={snap.InstanceId} netId={snap.UnitNetId} from={item.Remote} " +
-                    $"pos=({snap.Position.x:F1},{snap.Position.y:F1},{snap.Position.z:F1}) hullEuler=({e.x:F0},{e.y:F0},{e.z:F0}){extra}");
+                float rt = Time.time;
+                if (rt >= _verboseRecvLogPeriodEnd)
+                {
+                    _verboseRecvLogPeriodEnd = rt + 1f;
+                    _verboseRecvLogsThisPeriod = 0;
+                }
+
+                if (_verboseRecvLogsThisPeriod < VerboseRecvLogCapPerSecond)
+                {
+                    _verboseRecvLogsThisPeriod++;
+                    Vector3 e = snap.HullRotation.eulerAngles;
+                    string extra = snap.LegacyV1
+                        ? " legacy=v1"
+                        : $" token={snap.MissionToken} phase={snap.MissionPhaseWire}";
+                    MelonLogger.Msg(
+                        $"[CoopNet] recv seq={snap.Sequence} id={snap.InstanceId} netId={snap.UnitNetId} from={item.Remote} " +
+                        $"pos=({snap.Position.x:F1},{snap.Position.y:F1},{snap.Position.z:F1}) hullEuler=({e.x:F0},{e.y:F0},{e.z:F0}){extra}");
+                }
             }
         }
         if (_role == CoopNetRole.Client && _worldDatagramsThisTick > 0)
@@ -1150,7 +1201,7 @@ internal static class CoopUdpTransport
 
             uint token = CoopSessionState.MissionCoherenceToken;
             byte phase = CoopSessionState.MissionStateToWirePhase();
-            CoopNetPacket.WriteV3(
+            CoopNetPacket.WriteV6(
                 _sendBuffer,
                 _sendSequence,
                 CoopSessionState.LastSampledUnitInstanceId,
@@ -1160,8 +1211,11 @@ internal static class CoopUdpTransport
                 phase,
                 CoopSessionState.LastSampledTurretWorldRotation,
                 CoopSessionState.LastSampledGunWorldRotation,
-                CoopSessionState.LastSampledUnitNetId);
-            _udp.Send(_sendBuffer, CoopNetPacket.LengthV3, target);
+                CoopSessionState.LastSampledUnitNetId,
+                CoopSessionState.LastSampledWorldLinearVelocity,
+                CoopSessionState.LastSampledWorldAngularVelocity,
+                CoopSessionState.LastSampledBrakePresentation01);
+            _udp.Send(_sendBuffer, CoopNetPacket.LengthV6, target);
         }
         catch (Exception ex)
         {
@@ -1171,7 +1225,10 @@ internal static class CoopUdpTransport
 
     public static void OnSessionCleared()
     {
+        CoopChassisTrackVisualPresenter.ResetSession();
+        CoopChassisWheelVisualPresenter.ResetSession();
         HostPeerUnitPuppet.Reset();
+        ClientPeerUnitPuppet.Reset();
         _hostPeer = null;
         CoopNetSession.OnPlayingSessionEnded();
         CoopRemoteState.Clear();
@@ -1241,6 +1298,8 @@ internal static class CoopUdpTransport
                 deltaTime,
                 interval,
                 _logWorldReplicationSend,
+                _worldReplicationGhwV5Acceleration,
+                _worldReplicationGhwV6MotorInput,
                 _udp,
                 _hostPeer);
         }

@@ -92,13 +92,29 @@ internal static class ClientWorldProxyService
 
     public static void OnWorldDecoded(in CoopWorldPacketDecoded packet, bool logReceive)
     {
+        uint localTok = CoopSessionState.MissionCoherenceToken;
         if (!CoopSessionState.IsPlaying)
+        {
+            CoopReplicationDiagnostics.LogWorldPacketIgnored("!IsPlaying", packet.MissionPhase, packet.MissionToken, localTok, false);
             return;
+        }
+
         if (packet.MissionPhase != WirePlaying)
+        {
+            CoopReplicationDiagnostics.LogWorldPacketIgnored($"phase!=Playing({WirePlaying})", packet.MissionPhase, packet.MissionToken, localTok, true);
             return;
-        uint localToken = CoopSessionState.MissionCoherenceToken;
-        if (localToken == 0 || packet.MissionToken != localToken)
+        }
+
+        if (localTok == 0 || packet.MissionToken != localTok)
+        {
+            CoopReplicationDiagnostics.LogWorldPacketIgnored(
+                localTok == 0 ? "localToken==0" : "token_mismatch",
+                packet.MissionPhase,
+                packet.MissionToken,
+                localTok,
+                true);
             return;
+        }
 
         if (packet.PartCount == 1)
         {
@@ -155,6 +171,26 @@ internal static class ClientWorldProxyService
     private static void ApplyMergedSnapshot(List<WorldEntityWire> entities, bool logReceive, uint hostSeq)
     {
         ClientSimulationGovernor.OnMergedWorldSnapshot(entities);
+
+        if (CoopReplicationDiagnostics.Enabled && entities.Count > 0)
+        {
+            uint skip = CoopRemoteState.HasData && CoopRemoteState.RemoteUnitNetId != 0 ? CoopRemoteState.RemoteUnitNetId : 0;
+            var missingSample = new List<uint>(8);
+            int unresolved = 0;
+            foreach (WorldEntityWire e in entities)
+            {
+                if (e.NetId == 0 || e.NetId == skip)
+                    continue;
+                if (CoopUnitLookup.TryFindByNetId(e.NetId) != null)
+                    continue;
+                unresolved++;
+                if (missingSample.Count < 12)
+                    missingSample.Add(e.NetId);
+            }
+
+            CoopReplicationDiagnostics.LogGhwApplyClient(hostSeq, entities.Count, skip, unresolved, missingSample);
+        }
+
         if (!_captureProxies)
         {
             if (Proxies.Count > 0)

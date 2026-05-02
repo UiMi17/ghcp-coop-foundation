@@ -15,3 +15,4 @@ lib/MelonLoader/*.exe
 *.txt
 *.ps1
 *.diff
+.cursorignore
